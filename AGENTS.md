@@ -11,7 +11,7 @@ UMANS-DASH-GO/
 ├── proxy.go              # Full proxy implementation
 ├── cmd/umans-dash-go/
 │   └── main.go           # Entry point (startup sequence, signal handling)
-├── .cache/               # Cached wallpaper images (auto-created)
+├── .cache/               # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
 │   ├── wallpaper.jpg           # Cached Bing wallpaper (daily TTL)
 │   └── wallpaper-haven.jpg      # Cached Wallhaven wallpaper (hourly TTL)
 ├── .logs/                # HTTP error logs (auto-created, per-session rotating files)
@@ -31,11 +31,11 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 | Type | Purpose |
 |---|---|
-| `Config` | Runtime configuration (API keys, cache settings, concurrency override, etc.) |
+| `Config` | Runtime configuration (API keys, cache settings, concurrency override, **`ApiKeyMode`** / JSON `API_KEY_MODE`: `"smart"` (default), `"managed"`, or `"passthrough"`, **`BurstMode`** / JSON `BURST_MODE`: `bool` — gates concurrency at hard cap when `true`, etc.) |
 | `KeyConfig` | A single API key entry (name, key, session) |
 | `KeyPool` | Round-robin multi-key pool with cooldown/unhealthy marking |
 | `ImageHandoffCache` | LRU cache for vision handoff image descriptions (SHA-256 keyed, 50 entries, 24h TTL) |
-| `Proxy` | Central state holder — all runtime state lives here |
+| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `burstModeMu` (`RWMutex`) / `burstMode` for thread-safe burst mode state |
 | `ModelInfo` / `Capabilities` | Model metadata from upstream catalog |
 | `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types |
 | `ConcurrencyData` | Concurrency limits and current state |
@@ -103,24 +103,59 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `RedactHeaders(headers map[string][]string) map[string][]string`
 - `RedactBodyJson(body string) string`
 
+### API Key Mode & Client Key Tracking (§17)
+- `applyDefaultApiKeyMode(cfg *Config)` — defaults `ApiKeyMode` to `"smart"` when unset (called in `LoadConfig` paths)
+- `extractClientAPIKey(req *http.Request) string` — reads `X-Api-Key` header, else `Authorization: Bearer` token
+- `(*Proxy) setLastClientKey(key string)` — thread-safe write under `lastClientKeyMu.Lock`
+- `(*Proxy) getLastClientKey() string` — thread-safe read under `lastClientKeyMu.RLock`
+- `(*Proxy) upstreamAPIKeyForDashboard() string` — selects the key for usage/history/concurrency calls per mode: passthrough→last client key; smart→last client key with pool fallback; managed→pool key
+
+### Burst Mode (§5)
+- `(*Proxy) getBurstMode() bool` — thread-safe read under `burstModeMu.RLock`
+- `(*Proxy) setBurstMode(enabled bool)` — thread-safe write under `burstModeMu.Lock`
+- `(*Proxy) gateLimit() int` — returns the effective concurrency gate: Off → soft cap (`Limit`), On → hard cap (`HardCap`) if available else `Limit`; returns `-1` if no gate applies
+- `Config.BurstMode` (JSON `BURST_MODE`) persisted via `saveConfig()`; restored in `NewProxy()` on startup via `setBurstMode(cfg.BurstMode)`
+
 ### HTTP Helpers (§17)
-- `(*Proxy) Authorized(req *http.Request) bool`
+- `(*Proxy) Authorized(req *http.Request) bool` — behavior now depends on `ApiKeyMode`: `passthrough` requires a client key present; `smart` always accepts (client or own key used downstream); `managed` validates the client's key against configured `APIKeys` (or accepts if `APIKeys` is empty)
 - `ReadBody(req *http.Request) (string, error)` — 5 MB cap; uses `errors.Is(err, io.EOF)` for clean stream end
 - `WriteJSON(w, status, payload)`
 - `WriteOpenAIError(w, status, message, errType, code)`
 - `WriteAnthropicError(w, status, message, errType)`
 - `WritePassthroughError(w, status, body)` / `WriteAnthropicPassthroughError(w, status, body)`
 
+### Wallpaper Helpers (§30)
+- `upgradePeapixResolution(imageURL string) string` — regex `_NNNN.(jpg|jpeg|png)$` → `_3840` for UHD peapix images
+- `downloadImage(imageURL, userAgent string, timeout time.Duration) []byte` — HTTP fetch with UA + timeout
+- `isValidImage(data []byte) bool` — validates JPEG/PNG/WebP magic bytes
+- `isJPEG(data []byte) bool` — JPEG-only magic check (`0xFF 0xD8`)
+- `imageContentType(data []byte) string` — returns `"image/png"`, `"image/webp"`, or `"image/jpeg"` (fallback) based on magic bytes
+- `serveWallpaperImage(w, data, expires)` — serves image as `image/jpeg` (legacy; delegates to `serveWallpaperImageTyped`)
+- `serveWallpaperImageTyped(w, data, expires, contentType)` — typed wallpaper serving with caller-specified Content-Type
+- `saveCacheFile(cacheFile string, data []byte) bool` — writes cache file, mkdir if needed
+
 ### HTTP Handlers (§17–§29)
-- `(*Proxy) HandleHealthz(w, r)` / `HandleModels(w, r)` / `HandleConfigGet(w, r)`
+- `(*Proxy) HandleHealthz(w, r)` / `HandleModels(w, r)` / `HandleConfigGet(w, r)` — `HandleConfigGet` exposes `apikeyMode` and `burstMode` fields
+- `(*Proxy) HandleConfigPost(w, r)` — accepts `apikeyMode` (`managed`/`passthrough`/`smart`) and `burstMode` (`bool`); persists `burstMode` to `Config.BurstMode`, calls `setBurstMode()`, and triggers `ProcessQueue()` when enabling; triggers debounced save + opencode setup
 - `(*Proxy) HandleKeysGet(w, r)` / `HandleKeysPost(w, r)` — `HandleKeysGet` acquires `configMu.RLock()`
-- `(*Proxy) HandleUsage(w, r)` / `HandleConcurrency(w, r)`
+- `(*Proxy) HandleUsage(w, r)` / `HandleConcurrency(w, r)` — `FetchUsage`/`FetchUsageHistory` call `upstreamAPIKeyForDashboard()` before upstream calls
 - `(*Proxy) HandleUsageHistory(w, r)` / `HandleUser(w, r)` — `HandleUser` returns `user_id` from `LastConcurrency`
 - `(*Proxy) HandleRequest(w, r)` — main router
+- `(*Proxy) HandleBingWallpaper(w, r)` — daily cache; calls `upgradePeapixResolution()` for UHD variant
+- `(*Proxy) HandleWallhavenWallpaper(w, r)` — hourly cache; `atleast=2560x1440` filter; uses `isValidImage` + `serveWallpaperImageTyped` with `imageContentType`
 
 ### Opencode Config (§24)
 - `DiscoverOpencodeConfigs(homeDir string) []string` — only returns existing files
 - `(*Proxy) SetupOpencodeConfig(homeDir string, port int) bool` — no-op if no config exists
+
+### Dashboard (dashboard.html)
+- **Burst Mode toggle** — POSTs `burstMode` boolean to backend (`/api/config`) instead of using localStorage; backend persists to `Config.BurstMode` and calls `setBurstMode()`
+- `setWallpaper(src, skipConfigSave)` — `skipConfigSave` parameter avoids redundant POST during init
+- `loadConfig()` — decoupled from `/healthz` (fetched in background, not awaited); hides loader before `fetchUsage()` (fire-and-forget)
+- `toggleSection()` — swaps `bi-chevron-down` ↔ `bi-chevron-right` icon classes instead of CSS transform
+- `clearWallpaper()` — uses `setProperty(..., 'important')` to override server-injected `!important` CSS
+- **Unified refresh cycle** — all content (status, usage, concurrency, history) on one timer, persisted to localStorage
+- `fetchConcurrency()` — called on init (was missing previously)
 
 ## Building
 
@@ -136,11 +171,13 @@ The `Proxy` struct holds several dedicated mutexes. Code touching these fields m
 
 | Mutex | Protects | Notes |
 |-------|----------|-------|
-| `configMu` (RWMutex) | All `Config` fields | `RLock()` in read-only handlers (`proxyChatRequest`, `proxyAnthropicRequest`, `ResolveModelId`, `NeedsVisionHandoff`, `HandleKeysGet`). `Lock()` in `HandleConfigPost` / mutations. |
+| `configMu` (RWMutex) | All `Config` fields | `RLock()` in read-only handlers (`ResolveModelId`, `NeedsVisionHandoff`, `HandleKeysGet`, `HandleConfigGet`). `Lock()` in `HandleConfigPost` / mutations. **Note:** `proxyChatRequest` and `proxyAnthropicRequest` now snapshot needed config fields (`ApiKeyMode`, `MaxImages`, `UpstreamBaseURL`) under a brief `RLock` then release before the upstream call — previously held `RLock` for the entire request lifecycle, blocking `HandleConfigPost`. |
 | `queueMu` (RWMutex) | `ActiveRequests`, `requestQueue`, `ThrottledCount` | All access via accessor helpers (`getActiveRequests`, `getQueueLen`, `getThrottledCount`, `bumpThrottled`). Never read/write these fields directly. |
 | `catalogMu` (RWMutex) | `ModelInfoMap`, `DisplayNameMap` | `Lock()` in `ApplyCatalogData`; `RLock()` in all catalog readers. |
 | `convMu` (Mutex) | `conversationMap`, `globalSessionCounter` | Used by both OpenAI and Anthropic paths for session tracking. |
 | `rw.mu` (in `responseWriterTracker`) | Hijack/flush state | `Flush()` acquires `rw.mu`, checks `hijacked`, releases the lock, then calls `Flush()` — preventing flush-after-hijack panics. |
+| `lastClientKeyMu` (RWMutex) | `lastClientKey` | `Lock()` in `setLastClientKey`; `RLock()` in `getLastClientKey`. Tracks last-known-good client API key for usage/history calls when `ApiKeyMode` is `passthrough`/`smart`. |
+| `burstModeMu` (RWMutex) | `burstMode` | `Lock()` in `setBurstMode`; `RLock()` in `getBurstMode`. Gates `gateLimit()`: Off → soft cap (`Limit`), On → hard cap (`HardCap`). Restored from `Config.BurstMode` in `NewProxy()`. |
 
 **Graceful shutdown** (`Shutdown()`): polls `ActiveRequests` under `queueMu.RLock` every 100ms (5s timeout) before calling `httpServer.Shutdown()`, ensuring in-flight requests drain before the listener closes.
 

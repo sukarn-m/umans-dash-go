@@ -110,6 +110,9 @@ func NewProxy(cfg *Config) *Proxy {
 	}
 	p.ImageHandoffCache = NewImageHandoffCache(50, handoffTtl)
 
+	// Restore burst mode from config
+	p.setBurstMode(cfg.BurstMode)
+
 	// §31 step 3: Initialize KeyPool.
 	if len(cfg.Keys) > 0 {
 		p.KeyPool = NewKeyPool(cfg.Keys)
@@ -279,18 +282,30 @@ func LoadConfig() (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		applyEnvOverrides(&cfg)
+		applyDefaultApiKeyMode(&cfg)
 		return cfg, nil
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		cfg = DefaultConfig()
 		applyEnvOverrides(&cfg)
+		applyDefaultApiKeyMode(&cfg)
 		return cfg, err
 	}
 	applyEnvOverrides(&cfg)
 	if cfg.RequestTimeout.Duration <= 0 {
 		log.Fatal("RequestTimeout must be positive")
 	}
+	applyDefaultApiKeyMode(&cfg)
 	return cfg, nil
+}
+
+// applyDefaultApiKeyMode sets the default API key mode when it's not explicitly
+// configured. Defaults to "smart".
+func applyDefaultApiKeyMode(cfg *Config) {
+	if cfg.ApiKeyMode != "" {
+		return
+	}
+	cfg.ApiKeyMode = "smart"
 }
 
 func saveConfig(cfg Config) error {
@@ -2498,7 +2513,87 @@ func (p *Proxy) LogRetryableError(
 
 // ─── HTTP Helpers (§17) ────────────────────────────────────────────────────
 
+// extractClientAPIKey reads the bearer token or X-Api-Key from the client request.
+func extractClientAPIKey(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	if xKey := strings.TrimSpace(req.Header.Get("X-Api-Key")); xKey != "" {
+		return xKey
+	}
+	auth := strings.TrimSpace(req.Header.Get("Authorization"))
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+// setLastClientKey records a client API key that successfully reached upstream.
+// Used in passthrough mode for usage/history fetching.
+func (p *Proxy) setLastClientKey(key string) {
+	if key == "" {
+		return
+	}
+	p.lastClientKeyMu.Lock()
+	p.lastClientKey = key
+	p.lastClientKeyMu.Unlock()
+}
+
+// getLastClientKey returns the last-known-good client API key.
+func (p *Proxy) getLastClientKey() string {
+	p.lastClientKeyMu.RLock()
+	defer p.lastClientKeyMu.RUnlock()
+	return p.lastClientKey
+}
+
+// upstreamAPIKeyForDashboard returns the API key to use for upstream dashboard
+// calls (usage, concurrency, history). In passthrough mode, uses the
+// last-known-good client key. In smart mode, prefers the last-known-good client
+// key and falls back to the pool key. In managed mode, uses the pool key.
+func (p *Proxy) upstreamAPIKeyForDashboard() string {
+	p.configMu.RLock()
+	mode := p.Config.ApiKeyMode
+	p.configMu.RUnlock()
+	if mode == "passthrough" {
+		return p.getLastClientKey()
+	}
+	// Smart mode: prefer last-known-good client key, fall back to pool
+	if mode == "smart" {
+		if key := p.getLastClientKey(); key != "" {
+			return key
+		}
+	}
+	// Managed mode (or smart with no client key yet): use first available key
+	if p.KeyPool != nil {
+		if slot, ok := p.KeyPool.Acquire(-1); ok && slot != nil {
+			p.KeyPool.MarkHealthy(slot.Index)
+			return slot.Key
+		}
+	}
+	if p.Config.APIKey != "" {
+		return p.Config.APIKey
+	}
+	if len(p.Config.APIKeys) > 0 {
+		return p.Config.APIKeys[0]
+	}
+	return ""
+}
+
 func (p *Proxy) Authorized(req *http.Request) bool {
+	// In passthrough mode, accept any request with an API key — the client's
+	// key will be passed through to upstream.
+	p.configMu.RLock()
+	mode := p.Config.ApiKeyMode
+	p.configMu.RUnlock()
+	if mode == "passthrough" {
+		return extractClientAPIKey(req) != ""
+	}
+	// In smart mode, always accept — either the client's key will be used,
+	// or the proxy's own key will be used.
+	if mode == "smart" {
+		return true
+	}
+	// Managed mode: validate against configured keys.
 	if len(p.Config.APIKeys) == 0 {
 		return true
 	}
@@ -2805,8 +2900,14 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	payload map[string]interface{}, model string,
 	writeError ErrorWriter, writePassthroughError PassthroughErrorWriter) {
 
+	// Snapshot the config fields we need, then release the lock.
+	// Holding RLock for the entire upstream request blocks HandleConfigPost
+	// (which needs Lock) for the full duration of LLM completions.
 	p.configMu.RLock()
-	defer p.configMu.RUnlock()
+	cfgMode := p.Config.ApiKeyMode
+	cfgMaxImages := p.Config.MaxImages
+	cfgUpstreamURL := p.Config.UpstreamBaseURL
+	p.configMu.RUnlock()
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// Step 1: Key Acquisition (§19.1, §14.5)
@@ -2830,7 +2931,23 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	// Note: p.KeyPool may be nil in tests or when no keys are configured.
 	var slot *KeySlot
 	var currentKeyIndex int
-	if p.KeyPool != nil {
+	usingClientKey := false
+	clientKey := extractClientAPIKey(r)
+	mode := cfgMode
+	if (mode == "passthrough" || mode == "smart") && clientKey != "" {
+		// Pass-through or smart with a client key: use the client's key directly
+		usingClientKey = true
+		if p.Upstream != nil {
+			p.Upstream.SetAPIKey(clientKey)
+		}
+	} else if mode == "passthrough" {
+		// Pure passthrough with no client key — reject
+		if writeError != nil {
+			writeError(w, http.StatusUnauthorized,
+				"no API key provided by client", "authentication_error", "")
+		}
+		return
+	} else if p.KeyPool != nil {
 		slot, _ = p.KeyPool.Acquire(preferredIndex)
 		if slot == nil {
 			if writeError != nil {
@@ -2924,7 +3041,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 
 	needsHandoff := p.NeedsVisionHandoff(resolvedModel)
 	if !needsHandoff {
-		LimitImagesInMessages(payload, p.Config.MaxImages)
+		LimitImagesInMessages(payload, cfgMaxImages)
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2974,7 +3091,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 
 	_, retryErr := RetryLoop(func(attempt int, isLast bool) (bool, error) {
 		// ── Key rotation on retry (§15.3) ──
-		if attempt > 1 && p.KeyPool != nil && p.KeyPool.Total() > 1 {
+		if attempt > 1 && !usingClientKey && p.KeyPool != nil && p.KeyPool.Total() > 1 {
 			p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
 			newSlot, ok := p.KeyPool.Acquire(-1)
 			if !ok {
@@ -3010,7 +3127,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 				sessNum, slotName,
 				r.Method, r.URL.String(),
 				map[string][]string(r.Header), string(bodyBytes),
-				p.Config.UpstreamBaseURL+"/chat/completions", "POST",
+				cfgUpstreamURL+"/chat/completions", "POST",
 				map[string][]string{}, 502, "Bad Gateway", err.Error(),
 			)
 
@@ -3039,7 +3156,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 				sessNum, slotName,
 				r.Method, r.URL.String(),
 				map[string][]string(r.Header), string(bodyBytes),
-				p.Config.UpstreamBaseURL+"/chat/completions", "POST",
+				cfgUpstreamURL+"/chat/completions", "POST",
 				map[string][]string(resp.Header), resp.StatusCode, resp.Status, errBody,
 			)
 
@@ -3069,8 +3186,12 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 		}
 
 		// ── Success: HTTP 2xx (§19.12d) ──
-		if p.KeyPool != nil {
+		if !usingClientKey && p.KeyPool != nil {
 			p.KeyPool.MarkHealthy(currentKeyIndex)
+		}
+		// In passthrough/smart mode, record the client's key as last-known-good
+		if (cfgMode == "passthrough" || cfgMode == "smart") && clientKey != "" {
+			p.setLastClientKey(clientKey)
 		}
 
 		contentType := resp.Header.Get("Content-Type")
@@ -3129,8 +3250,11 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 
 // proxyAnthropicRequest handles an Anthropic-format messages request (§20).
 func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
+	// Snapshot config fields, then release lock (see proxyChatRequest for rationale).
 	p.configMu.RLock()
-	defer p.configMu.RUnlock()
+	cfgMode := p.Config.ApiKeyMode
+	cfgMaxImages := p.Config.MaxImages
+	p.configMu.RUnlock()
 
 	w := item.Response
 	r := item.Req
@@ -3144,7 +3268,21 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	// Note: p.KeyPool may be nil in tests or when no keys are configured.
 	var slot *KeySlot
 	var ok bool
-	if p.KeyPool != nil {
+	usingClientKey := false
+	clientKey := extractClientAPIKey(r)
+	mode := cfgMode
+	if (mode == "passthrough" || mode == "smart") && clientKey != "" {
+		// Pass-through or smart with a client key: use the client's key directly
+		usingClientKey = true
+		if p.Upstream != nil {
+			p.Upstream.SetAPIKey(clientKey)
+		}
+	} else if mode == "passthrough" {
+		// Pure passthrough with no client key — reject
+		WriteAnthropicError(w, http.StatusUnauthorized,
+			"no API key provided by client", "authentication_error")
+		return
+	} else if p.KeyPool != nil {
 		slot, ok = p.KeyPool.Acquire(preferredIndex)
 		if !ok {
 			WriteAnthropicError(w, http.StatusServiceUnavailable,
@@ -3164,7 +3302,9 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		existing := p.TouchConversation(fp)
 		if existing != nil {
 			existing.RequestCount++
-			existing.TokenIndex = slot.Index
+			if slot != nil {
+				existing.TokenIndex = slot.Index
+			}
 			p.TrackConversationSession(fp, existing, true)
 			sessNum = existing.SessNum
 		} else {
@@ -3173,9 +3313,12 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 			sessNum = p.globalSessionCounter
 			p.convMu.Unlock()
 			newSess := &ConversationSession{
-				TokenIndex:   slot.Index,
+				TokenIndex:   0,
 				RequestCount: 1,
 				SessNum:      sessNum,
+			}
+			if slot != nil {
+				newSess.TokenIndex = slot.Index
 			}
 			p.TrackConversationSession(fp, newSess, true)
 			// Log first prompt of this session (mirrors OpenAI path §19.2).
@@ -3193,7 +3336,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	NormalizeThinkingPayload(payload)
 
 	// STEP 5: Limit images (§20.3)
-	LimitImagesInMessages(payload, p.Config.MaxImages)
+	LimitImagesInMessages(payload, cfgMaxImages)
 
 	// STEP 5b: Model resolution (same as OpenAI path)
 	resolvedModel := p.ResolveModelId(model)
@@ -3231,7 +3374,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		// STEP 9: Network error → 502 (§20.9)
 		errBody := fmt.Sprintf(`{"error":{"type":"api_error","message":"upstream network error: %v"}}`, err)
 		WriteAnthropicPassthroughError(w, http.StatusBadGateway, errBody)
-		if p.KeyPool != nil {
+		if p.KeyPool != nil && slot != nil {
 			p.KeyPool.MarkUnhealthy(slot.Index, http.StatusBadGateway)
 		}
 		return
@@ -3250,7 +3393,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 
 		// §20 line 913: Mark unhealthy ONLY on 503, NOT on 500
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			if p.KeyPool != nil {
+			if p.KeyPool != nil && slot != nil {
 				p.KeyPool.MarkUnhealthy(slot.Index, http.StatusServiceUnavailable)
 			}
 		}
@@ -3262,8 +3405,12 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	}
 
 	// STEP 11: Success (§20.8)
-	if p.KeyPool != nil {
+	if !usingClientKey && p.KeyPool != nil && slot != nil {
 		p.KeyPool.MarkHealthy(slot.Index)
+	}
+	// In passthrough/smart mode, record the client's key as last-known-good
+	if (cfgMode == "passthrough" || cfgMode == "smart") && clientKey != "" {
+		p.setLastClientKey(clientKey)
 	}
 
 	// Set headers (§20 line 916)
@@ -3285,6 +3432,11 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 // The defer OnRequestComplete() ensures activeRequests is decremented regardless.
 func (p *Proxy) dispatchQueuedItem(item QueueItem) {
 	defer func() {
+		if rv := recover(); rv != nil {
+			stack := make([]byte, 4096)
+			n := runtime.Stack(stack, false)
+			log.Printf("PANIC recovered in dispatchQueuedItem: %v\n%s", rv, stack[:n])
+		}
 		p.OnRequestComplete()
 	}()
 
@@ -3301,6 +3453,17 @@ func (p *Proxy) dispatchQueuedItem(item QueueItem) {
 // Caller must NOT hold queueMu — this method does not acquire it.
 func (p *Proxy) gateLimit() int {
 	eff := p.GetEffectiveConcurrency(p.LastConcurrency)
+	// Burst mode off → gate at soft cap (Limit).
+	// Burst mode on → gate at hard cap (HardCap) if available, else Limit.
+	if !p.getBurstMode() {
+		if eff.Limit != nil {
+			return *eff.Limit
+		}
+		if eff.HardCap != nil {
+			return *eff.HardCap
+		}
+		return -1
+	}
 	if eff.HardCap != nil {
 		return *eff.HardCap
 	}
@@ -3308,6 +3471,20 @@ func (p *Proxy) gateLimit() int {
 		return *eff.Limit
 	}
 	return -1
+}
+
+// getBurstMode returns the current burst mode setting (thread-safe).
+func (p *Proxy) getBurstMode() bool {
+	p.burstModeMu.RLock()
+	defer p.burstModeMu.RUnlock()
+	return p.burstMode
+}
+
+// setBurstMode updates the burst mode setting (thread-safe).
+func (p *Proxy) setBurstMode(enabled bool) {
+	p.burstModeMu.Lock()
+	p.burstMode = enabled
+	p.burstModeMu.Unlock()
 }
 
 // TryEnqueueOrDispatch attempts to dispatch a request immediately if under the
@@ -3453,7 +3630,10 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 		return data
 	}
 
-	// Fetch from upstream
+	// Fetch from upstream — set the dashboard API key before calling
+	if p.Upstream != nil {
+		p.Upstream.SetAPIKey(p.upstreamAPIKeyForDashboard())
+	}
 	raw, err := p.Upstream.GetUsage()
 	if err != nil {
 		// On error/non-OK: return cached data or nil (§6.1)
@@ -3469,7 +3649,6 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 		Usage              UsageInfo     `json:"usage"`
 		Window             WindowInfo    `json:"window"`
 		Plan               PlanInfo      `json:"plan"`
-		ConcurrentSessions int           `json:"concurrent_sessions"`
 		Limits             *UsageLimits  `json:"limits"`
 		UserID             string        `json:"user_id"`
 	}
@@ -3485,7 +3664,7 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 		Usage:              fullResp.Usage,
 		Window:             fullResp.Window,
 		Plan:               fullResp.Plan,
-		ConcurrentSessions: fullResp.ConcurrentSessions,
+		ConcurrentSessions: fullResp.Usage.ConcurrentSessions,
 		Limits:             fullResp.Limits,
 		UserID:             fullResp.UserID,
 	}
@@ -3553,6 +3732,9 @@ func (p *Proxy) FetchUsageHistory(from, to, granularity, scope string, fresh boo
 			"buckets":     []interface{}{},
 		}
 	}
+
+	// Set the dashboard API key before fetching from upstream
+	p.Upstream.SetAPIKey(p.upstreamAPIKeyForDashboard())
 
 	// Build URL with query params
 	params := url.Values{}
@@ -4285,6 +4467,9 @@ func (p *Proxy) HandleConfigGet(w http.ResponseWriter, r *http.Request) {
 		"visionHandoffModel":       p.Config.VisionHandoffModel,
 		"visionHandoffPrompt":      p.Config.VisionHandoffPrompt,
 		"visionHandoffCacheEnabled": p.Config.VisionHandoffCacheEnabled,
+		"wallpaperSource":           p.Config.WallpaperSource,
+		"apikeyMode":                p.Config.ApiKeyMode,
+		"burstMode":                 p.getBurstMode(),
 	})
 }
 
@@ -4388,6 +4573,18 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 	if v, ok := data["visionHandoffCacheEnabled"].(bool); ok {
 		p.Config.VisionHandoffCacheEnabled = v
 	}
+	if v, ok := data["apikeyMode"].(string); ok {
+		if v == "managed" || v == "passthrough" || v == "smart" {
+			p.Config.ApiKeyMode = v
+		}
+	}
+	if v, ok := data["burstMode"].(bool); ok {
+		p.Config.BurstMode = v
+		p.setBurstMode(v)
+		if v {
+			go p.ProcessQueue()
+		}
+	}
 	if v, ok := data["keys"].([]interface{}); ok {
 		keys := make([]KeyConfig, 0, len(v))
 		for _, k := range v {
@@ -4424,6 +4621,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		"visionHandoffModel":        p.Config.VisionHandoffModel,
 		"visionHandoffPrompt":       p.Config.VisionHandoffPrompt,
 		"visionHandoffCacheEnabled": p.Config.VisionHandoffCacheEnabled,
+		"wallpaperSource":           p.Config.WallpaperSource,
+		"apikeyMode":                p.Config.ApiKeyMode,
+		"burstMode":                 p.getBurstMode(),
 		"restartRequired":           restartRequired,
 	})
 }
@@ -4763,7 +4963,13 @@ func endOfTodayUTC() time.Time {
 // serveWallpaperImage writes image data to the response with image/jpeg content type
 // and optional Expires header. Used by both wallpaper handlers.
 func serveWallpaperImage(w http.ResponseWriter, data []byte, expires *time.Time) {
-	w.Header().Set("Content-Type", "image/jpeg")
+	serveWallpaperImageTyped(w, data, expires, "image/jpeg")
+}
+
+// serveWallpaperImageTyped writes image data to the response with an optional
+// Expires header and a caller-specified content type.
+func serveWallpaperImageTyped(w http.ResponseWriter, data []byte, expires *time.Time, contentType string) {
+	w.Header().Set("Content-Type", contentType)
 	if expires != nil {
 		w.Header().Set("Expires", expires.UTC().Format(http.TimeFormat))
 	}
@@ -4812,6 +5018,41 @@ func isJPEG(data []byte) bool {
 	return len(data) >= 2 && data[0] == 0xFF && data[1] == 0xD8
 }
 
+// isValidImage checks whether data starts with a recognized image format magic
+// bytes (JPEG, PNG, or WebP). Used for validating freshly downloaded wallpapers.
+func isValidImage(data []byte) bool {
+	if len(data) < 2 {
+		return false
+	}
+	// JPEG: FF D8
+	if data[0] == 0xFF && data[1] == 0xD8 {
+		return true
+	}
+	// PNG: 89 50 4E 47
+	if len(data) >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return true
+	}
+	// WebP: 52 49 46 46 ?? ?? ?? ?? 57 45 42 50 (RIFF....WEBP)
+	if len(data) >= 12 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+		data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+		return true
+	}
+	return false
+}
+
+// imageContentType returns the MIME content type for a valid image, or
+// "image/jpeg" as fallback.
+func imageContentType(data []byte) string {
+	if len(data) >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return "image/png"
+	}
+	if len(data) >= 12 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+		data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+		return "image/webp"
+	}
+	return "image/jpeg"
+}
+
 // HandleRestart is the real restart handler routed from /api/restart.
 // It responds with success and then exits the process with code 42 after
 // a short delay so the HTTP response is flushed. §17.1 Route #13.
@@ -4829,6 +5070,16 @@ func (p *Proxy) HandleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	time.AfterFunc(500*time.Millisecond, p.triggerRestart)
+}
+
+// upgradePeapixResolution replaces the resolution suffix in a peapix image URL
+// with _3840 for UHD (3840x2160) output. Falls back to the original URL if the
+// pattern doesn't match.
+func upgradePeapixResolution(imageURL string) string {
+	// Peapix URLs look like: https://img.peapix.com/<hash>_1920.jpg
+	// Replace the _NNNN suffix before .jpg with _3840.
+	re := regexp.MustCompile(`_\d+\.(jpg|jpeg|png)$`)
+	return re.ReplaceAllString(imageURL, "_3840.$1")
 }
 
 // HandleBingWallpaper proxies the daily Bing wallpaper via peapix.com.
@@ -4954,6 +5205,9 @@ func (p *Proxy) HandleBingWallpaper(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upgrade to UHD (3840) variant for large screens — replaces _1920, _640, etc.
+	imageURL = upgradePeapixResolution(imageURL)
+
 	// Download the image with 30s timeout and browser User-Agent.
 	imageData := downloadImage(imageURL, peapixUA, 30*time.Second)
 	if imageData == nil || !isJPEG(imageData) {
@@ -5006,8 +5260,8 @@ func (p *Proxy) HandleWallhavenWallpaper(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Fetch from wallhaven.cc API
-	wallhavenURL := "https://wallhaven.cc/api/v1/search?categories=100&purity=100&topRange=1M&sorting=toplist&order=desc&page=3"
+	// Fetch from wallhaven.cc API — filter for >=1440p wallpapers
+	wallhavenURL := "https://wallhaven.cc/api/v1/search?categories=100&purity=100&topRange=1M&sorting=toplist&order=desc&page=3&atleast=2560x1440"
 	wallhavenUA := "umans-proxy/1.0"
 	browserUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -5069,7 +5323,7 @@ func (p *Proxy) HandleWallhavenWallpaper(w http.ResponseWriter, r *http.Request)
 
 	// Download the image with 30s timeout and browser User-Agent.
 	imageData := downloadImage(imageURL, browserUA, 30*time.Second)
-	if imageData == nil || !isJPEG(imageData) {
+	if imageData == nil || !isValidImage(imageData) {
 		fallback()
 		return
 	}
@@ -5078,7 +5332,7 @@ func (p *Proxy) HandleWallhavenWallpaper(w http.ResponseWriter, r *http.Request)
 	saveCacheFile(cacheFile, imageData)
 
 	// Serve the fresh image.
-	serveWallpaperImage(w, imageData, nil)
+	serveWallpaperImageTyped(w, imageData, nil, imageContentType(imageData))
 }
 
 // PerformVisionHandoff replaces images with text descriptions from the handoff
@@ -5289,7 +5543,8 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 			if data, err := os.ReadFile(wpPath); err == nil {
 				b64 := base64.StdEncoding.EncodeToString(data)
-				inject = fmt.Sprintf(`<style>body{background-image:url('data:image/jpeg;base64,%s')}</style>`, b64)
+				ct := imageContentType(data)
+				inject = fmt.Sprintf(`<style>body{background-image:url('data:%s;base64,%s')!important;background-size:cover!important;background-position:center!important;background-repeat:no-repeat!important;background-attachment:fixed!important;background-color:#070912}</style>`, ct, b64)
 			} else {
 				// No cached wallpaper file → fall back to dark background
 				inject = `<style>body{background:#0d1117}</style>`

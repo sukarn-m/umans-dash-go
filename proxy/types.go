@@ -51,6 +51,8 @@ type Config struct {
 	VisionHandoffCacheEnabled bool           `json:"VISION_HANDOFF_CACHE_ENABLED"`
 	VisionHandoffCacheTtl   Duration          `json:"VISION_HANDOFF_CACHE_TTL"`
 	WallpaperSource         string            `json:"wallpaperSource"`
+	ApiKeyMode              string            `json:"API_KEY_MODE"` // "smart" (default), "managed", or "passthrough"
+	BurstMode               bool              `json:"BURST_MODE"`
 }
 
 // Duration is a wrapper around time.Duration that can be JSON-serialized.
@@ -132,10 +134,19 @@ type Pricing struct {
 
 // UsageInfo holds the current usage window data.
 type UsageInfo struct {
-	RequestsInWindow int `json:"requests_in_window"`
-	TokensIn         int `json:"tokens_in"`
-	TokensOut        int `json:"tokens_out"`
-	TokensCached     int `json:"tokens_cached"`
+	RequestsInWindow   int           `json:"requests_in_window"`
+	TokensIn           int           `json:"tokens_in"`
+	TokensOut          int           `json:"tokens_out"`
+	TokensCached       int           `json:"tokens_cached"`
+	ConcurrentSessions int           `json:"concurrent_sessions"`
+	Priority           *PriorityInfo `json:"priority"`
+}
+
+// PriorityInfo holds the upstream priority status.
+type PriorityInfo struct {
+	Low        bool    `json:"low"`
+	BoxedUntil *string `json:"boxed_until"`
+	Reason     *string `json:"reason"`
 }
 
 // WindowInfo holds the usage window metadata.
@@ -468,6 +479,16 @@ type Proxy struct {
 
 	// Wallpaper cache mutex (§30) — protects .cache/wallpaper*.jpg file operations
 	wallpaperMu sync.Mutex
+
+	// Pass-through mode: last-known-good client API key used for usage/history
+	// fetching when ApiKeyMode == "passthrough".
+	lastClientKeyMu sync.RWMutex
+	lastClientKey   string
+
+	// Burst mode: when false, gateLimit() returns the soft cap (Limit).
+	// When true, returns the hard cap (HardCap) if available, else Limit.
+	burstModeMu sync.RWMutex
+	burstMode   bool
 }
 
 // responseWriterTracker wraps an http.ResponseWriter to track whether

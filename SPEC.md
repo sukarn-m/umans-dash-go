@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-A local HTTP reverse proxy that sits between OpenAI/Anthropic-compatible clients (e.g. opencode) and the UMANS AI upstream API (`https://api.code.umans.ai/v1`). The proxy provides multi-key pool management, concurrency limiting with a bounded queue, response caching, retry logic with key rotation, vision handoff for models that cannot see images, tool schema normalization, model catalog management, usage tracking, opencode config auto-discovery, and a dashboard.
+A local HTTP reverse proxy that sits between OpenAI/Anthropic-compatible clients (e.g. opencode) and the UMANS AI upstream API (`https://api.code.umans.ai/v1`). The proxy provides multi-key pool management, API key mode selection (smart/managed/passthrough), concurrency limiting with a bounded queue, response caching, retry logic with key rotation, vision handoff for models that cannot see images, tool schema normalization, model catalog management, usage tracking, opencode config auto-discovery, UHD wallpaper support, and a dashboard.
 
 ### Design Principles
 
@@ -46,8 +46,14 @@ Path: `.config/config.json` (relative to the binary's working directory).
   "VISION_HANDOFF_PROMPT": "",
   "VISION_HANDOFF_CACHE_ENABLED": false,
   "VISION_HANDOFF_CACHE_TTL": "24h",
+  "API_KEY_MODE": "smart",
+  "BURST_MODE": false
 }
 ```
+
+The `API_KEY_MODE` field controls how the proxy handles API keys (see §27). Valid values: `"smart"` (default), `"managed"`, `"passthrough"`.
+
+The `BURST_MODE` field (bool) controls the concurrency gate limit (§5.3). When `false`, the proxy gates at the soft cap (`limit`). When `true`, it gates at the hard cap (`hard_cap`), allowing requests to burst past the soft cap up to the hard ceiling. Defaults to `false`.
 
 ### 2.2 Defaults
 
@@ -59,6 +65,8 @@ Path: `.config/config.json` (relative to the binary's working directory).
 | `OVERRIDE_CONCURRENCY` | `0` | Override concurrency limit (0 = use API limit) |
 | `MAX_IMAGES` | `9` | Max images per request |
 | `wallpaperSource` | `bing` | Wallpaper source: `none`, `bing`, or `wallhaven` |
+| `API_KEY_MODE` | `smart` | API key handling mode: `smart`, `managed`, or `passthrough` (§27) |
+| `BURST_MODE` | `false` | When true, `gateLimit()` uses hard cap instead of soft cap (§5.3) |
 | `VISION_HANDOFF_ENABLED` | `false` | Enable vision handoff |
 | `VISION_HANDOFF_MODEL` | `umans-coder` | Model to use for image analysis |
 | `VISION_HANDOFF_PROMPT` | `""` (uses built-in default) | System prompt for image analysis |
@@ -78,6 +86,7 @@ Env vars override config file values:
 | `API_KEYS` | `API_KEYS` | Comma-separated |
 | `OVERRIDE_CONCURRENCY` | `OVERRIDE_CONCURRENCY` | Parsed as int |
 | `MAX_IMAGES` | `MAX_IMAGES` | Parsed as int |
+| `API_KEY_MODE` | `API_KEY_MODE` | `smart`, `managed`, or `passthrough` |
 | `VISION_HANDOFF_ENABLED` | `VISION_HANDOFF_ENABLED` | `"false"` disables |
 | `VISION_HANDOFF_CACHE_ENABLED` | `VISION_HANDOFF_CACHE_ENABLED` | `"false"` disables |
 | `VISION_HANDOFF_CACHE_TTL` | `VISION_HANDOFF_CACHE_TTL` | |
@@ -87,6 +96,7 @@ Env vars override config file values:
 `LoadConfig` validates critical fields after parsing and env-var overrides:
 
 - `RequestTimeout` must be positive (`> 0`). A zero or negative value is a fatal error (`log.Fatal`).
+- `applyDefaultApiKeyMode(&cfg)` is called last — if `ApiKeyMode` is empty, it defaults to `"smart"` (§27).
 
 ### 2.4 `parseDuration(str)` → `time.Duration`
 
@@ -254,7 +264,14 @@ type QueueItem struct {
 
 ### 5.3 Concurrency Gating
 
-The gate limit is `hard_cap ?? limit` (hard_cap preferred). If `hard_cap` is null and `limit` is null, no gating occurs (all requests execute immediately).
+The gate limit depends on **burst mode** (`getBurstMode()`, backed by `Config.BurstMode`):
+
+- **Burst mode Off** (default): gate at the soft cap (`limit`). If `limit` is null, no gating.
+- **Burst mode On**: gate at the hard cap (`hard_cap`). If `hard_cap` is null, falls back to `limit`.
+
+If no gate applies (both null under the active mode), all requests execute immediately.
+
+`getBurstMode()` and `setBurstMode(enabled)` are thread-safe accessors protected by `burstModeMu` (`sync.RWMutex`). `NewProxy()` calls `setBurstMode(cfg.BurstMode)` on startup to restore the persisted state. `HandleConfigPost` calls `setBurstMode()` after updating config, and triggers `ProcessQueue()` (asynchronously) when enabling burst mode — this immediately dispatches any queued requests that now fit under the raised gate.
 
 If `activeRequests >= gateLimit`:
 - If queue is full (`len(requestQueue) >= MAX_QUEUE_SIZE`): increment `throttledCount`, return 503 with `queue_full` error.
@@ -803,11 +820,15 @@ Append `--- HTTP ERROR ---\n{json}\n\n` to the error log file.
 
 ### 17.2 Authentication
 
-`authorized(req)`:
-- If `config.apiKeys` is empty → allow all (open access).
-- Check `X-Api-Key` header against `config.apiKeys`.
-- Check `Authorization: Bearer {key}` header against `config.apiKeys`.
-- If neither matches → 401.
+`Authorized(req)` — behavior depends on `ApiKeyMode` (§27):
+
+- **`passthrough`**: Accept any request that carries a client API key (`extractClientAPIKey(req) != ""`). The client's key will be passed through to upstream.
+- **`smart`**: Always accept (`return true`). Either the client's key will be used, or the proxy's own key.
+- **`managed`**: Validate against `config.APIKeys`:
+  - If `config.APIKeys` is empty → allow all (open access).
+  - Check `X-Api-Key` header against `config.APIKeys`.
+  - Check `Authorization: Bearer *** header against `config.APIKeys`.
+  - If neither matches → 401.
 
 ### 17.3 Request Body Reading
 
@@ -861,8 +882,16 @@ Append `--- HTTP ERROR ---\n{json}\n\n` to the error log file.
 2. If not found → 404.
 3. Determine wallpaper style:
    - `none`: Inject `<style>body{background:#0d1117}</style>` before `</head>`.
-   - `bing` or `wallhaven`: If a cached wallpaper file exists (`.cache/wallpaper.jpg` or `.cache/wallpaper-haven.jpg`), embed as base64 in a `<style>` tag with `background-image` to prevent white flash. If no cached file, fall back to dark background.
-4. Serve as `text/html`.
+   - `bing` or `wallhaven`: If a cached wallpaper file exists (`.cache/wallpaper.jpg` or `.cache/wallpaper-haven.jpg`), embed as base64 in a `<style>` tag with full background properties:
+     ```html
+     <style>body{background-image:url('data:{contentType};base64,{data}')!important;
+       background-size:cover!important;background-position:center!important;
+       background-repeat:no-repeat!important;background-attachment:fixed!important;
+       background-color:#070912}</style>
+     ```
+     The `contentType` is determined by `imageContentType()` (§30.3). If no cached file, fall back to dark background (`#0d1117`).
+4. Inject before `</head>`; if no `</head>` found, append to the end.
+5. Serve as `text/html`.
 
 ---
 
@@ -870,8 +899,12 @@ Append `--- HTTP ERROR ---\n{json}\n\n` to the error log file.
 
 Full request pipeline for `/v1/chat/completions`:
 
-1. **Config lock**: Acquire `configMu.RLock()` for the duration of config reads.
-2. **Key acquire**: Fingerprint → session lookup → preferred key → round-robin fallback. 503 if no healthy keys.
+1. **Config snapshot**: Acquire `configMu.RLock()` briefly to snapshot the needed fields (`ApiKeyMode`, `MaxImages`, `UpstreamBaseURL`), then release the lock immediately. This avoids holding the RLock for the entire upstream request lifecycle, which would block `HandleConfigPost` (which needs `configMu.Lock()`) for the full duration of LLM completions. The snapshotted values (`cfgMode`, `cfgMaxImages`, `cfgUpstreamURL`) are used throughout the rest of the pipeline.
+2. **Key acquire**: Mode-aware key selection (§27):
+   - Read `clientKey = extractClientAPIKey(r)`.
+   - If mode is `passthrough` or `smart` **and** `clientKey != ""`: set `usingClientKey = true`, call `p.Upstream.SetAPIKey(clientKey)`. Pool acquire is skipped entirely.
+   - If mode is `passthrough` with no client key: reject with 401 `authentication_error`.
+   - Otherwise (managed, or smart/managed with no client key): acquire from pool via `KeyPool.Acquire(preferredIndex)`. 503 if no healthy keys.
 3. **Session tracking**: New or existing session. Log first prompt.
 4. **`stripReasoningContent`**: Remove reasoning fields from assistant messages.
 5. **Model resolution**: `resolveModelId(requestedModel)`.
@@ -882,18 +915,19 @@ Full request pipeline for `/v1/chat/completions`:
 10. **Vision handoff preparation**: If handoff needed and streaming, flush SSE headers + keepalive comment.
 11. **`performVisionHandoff`**: Replace images with text descriptions.
 12. **Retry loop**:
-    a. On retry > 1: try to acquire a fresh key if pool > 1.
+    a. On retry > 1: try to acquire a fresh key **only if** `!usingClientKey` and pool > 1.
     b. Call `upstream.chatCompletions(payload)`.
-    c. On network error: mark unhealthy, retry (or 502 if last attempt).
+    c. On network error: mark unhealthy (only if `!usingClientKey`), retry (or 502 if last attempt).
     d. On HTTP 2xx:
-       - Mark key healthy.
+       - Mark key healthy (only if `!usingClientKey`).
+       - If mode is `passthrough` or `smart` and `clientKey != ""`: call `setLastClientKey(clientKey)` to record last-known-good.
        - If SSE content type:
           - Pipe SSE stream directly to client with backpressure handling.
         - If JSON:
           - Parse response body.
           - If streaming was requested (but got JSON): wrap as SSE chunk.
          - Write response, cache non-streaming responses.
-    e. On HTTP 500/503: mark unhealthy, log error, retry (or pass through error if last).
+    e. On HTTP 500/503: mark unhealthy (only if `!usingClientKey`), log error, retry (or pass through error if last).
     f. On other HTTP errors: pass through error immediately.
 
 ---
@@ -902,9 +936,12 @@ Full request pipeline for `/v1/chat/completions`:
 
 Pass-through for `/v1/messages` and `/messages`:
 
-1. **Config lock**: Acquire `configMu.RLock()` for the duration of config reads.
+1. **Config snapshot**: Acquire `configMu.RLock()` briefly to snapshot the needed fields (`ApiKeyMode`, `MaxImages`), then release the lock immediately. Same rationale as §19 — avoids blocking config writes during the upstream call. The snapshotted values (`cfgMode`, `cfgMaxImages`) are used throughout the pipeline.
 2. **Nil guards**: All access to `KeyPool` and `Upstream` is guarded — if either is nil, a 503/500 error is returned immediately rather than panicking.
-3. **Key acquire**: Same session affinity as OpenAI path.
+3. **Key acquire**: Mode-aware key selection (§27), same logic as OpenAI path (§19 step 2):
+   - If mode is `passthrough` or `smart` **and** `clientKey != ""`: set `usingClientKey = true`, call `p.Upstream.SetAPIKey(clientKey)`.
+   - If mode is `passthrough` with no client key: reject with 401 `authentication_error`.
+   - Otherwise: acquire from pool. 503 if no healthy keys.
 4. **Session tracking**: Same as OpenAI path. Log first prompt of a new session (80-char truncated).
 5. **`normalizeThinkingPayload`**: Fix camelCase.
 6. **Model resolution**: `resolveModelId(requestedModel)`, set `payload.model`.
@@ -915,15 +952,16 @@ Pass-through for `/v1/messages` and `/messages`:
 11. **On HTTP >= 400**:
     - Log error.
     - `writeAnthropicPassthroughError`.
-    - Mark unhealthy only on 503 (not 500, which is usually a payload issue).
+    - Mark unhealthy only on 503 (not 500, which is usually a payload issue) — **only if** `!usingClientKey`.
     - Bump throttled on 429 or 503.
 12. **On success**:
-    - Mark key healthy.
+    - Mark key healthy (only if `!usingClientKey`).
+    - If mode is `passthrough` or `smart` and `clientKey != ""`: call `setLastClientKey(clientKey)`.
     - Write upstream status + headers (`Content-Type`, `Cache-Control: no-cache`, `Connection: keep-alive`).
     - Pipe body to response with backpressure + client disconnect detection.
 13. **On network error**:
     - `writeAnthropicPassthroughError` with 502.
-    - Mark unhealthy (502).
+    - Mark unhealthy (502) — only if `!usingClientKey`.
 
 **No cache, no retry for Anthropic path.**
 
@@ -1089,17 +1127,20 @@ Returns config with API key masked:
   "visionHandoffModel": "umans-coder",
   "visionHandoffPrompt": "",
   "visionHandoffCacheEnabled": false,
+  "wallpaperSource": "bing",
+  "apikeyMode": "smart",
+  "burstMode": false
 }
 ```
 
 ### 25.2 `POST /api/config`
 
 Accepts partial config updates. Updates any provided fields:
-- `apiKey`, `apiKeys`, `listenAddr`, `enabledModels`, `modelDisplayNames`, `wallpaperSource` (`none`, `bing`, or `wallhaven`), `overrideConcurrency`, `maxImages`, `disabledModels`, `visionHandoffEnabled`, `visionHandoffModel`, `visionHandoffPrompt`, `visionHandoffCacheEnabled`, `keys` (rebuilds key pool).
+- `apiKey`, `apiKeys`, `listenAddr`, `enabledModels`, `modelDisplayNames`, `wallpaperSource` (`none`, `bing`, or `wallhaven`), `overrideConcurrency`, `maxImages`, `disabledModels`, `visionHandoffEnabled`, `visionHandoffModel`, `visionHandoffPrompt`, `visionHandoffCacheEnabled`, `apikeyMode` (`smart`, `managed`, or `passthrough`), `burstMode` (bool — persists to `Config.BurstMode`, calls `setBurstMode()`, and triggers `ProcessQueue()` asynchronously when set to `true`), `keys` (rebuilds key pool).
 
 After update: `debouncedSaveConfig()` + `debouncedSetupOpencodeConfig()`.
 
-**Response includes `restartRequired`**: If the `listenAddr` field is changed in the POST, the response sets `restartRequired: true` to signal the dashboard that a proxy restart is needed for the new port to take effect.
+**Response includes `restartRequired`**: If the `listenAddr` field is changed in the POST, the response sets `restartRequired: true` to signal the dashboard that a proxy restart is needed for the new port to take effect. The response also echoes back the full config (same fields as `GET /api/config`).
 
 ---
 
@@ -1125,6 +1166,58 @@ Actions:
 - `delete`: Remove key at index. If empty, push a placeholder `{name: "Key 1", key: "", session: ""}`. If index 0, update `config.apiKey`. Rebuild pool.
 
 All actions: `debouncedSaveConfig()` + `debouncedSetupOpencodeConfig()`.
+
+---
+
+## 27. API Key Mode
+
+Controls how the proxy handles API keys for authentication, request proxying, and dashboard (usage/history) calls. Configured via `API_KEY_MODE` (§2.1), defaults to `"smart"` via `applyDefaultApiKeyMode()` (§2.3.1).
+
+### 27.1 Modes
+
+| Mode | Auth | Proxy Key Source | Dashboard/Usage Key Source |
+|------|------|-----------------|---------------------------|
+| `smart` (default) | Always accept | Client key if provided, else pool | Last-known-good client key, else pool |
+| `managed` | Validate against `APIKeys` | Pool (round-robin) | Pool (first available) |
+| `passthrough` | Require client key | Client key only | Last-known-good client key |
+
+### 27.2 `extractClientAPIKey(req) string`
+
+Reads the API key from the incoming client request:
+1. Check `X-Api-Key` header (trimmed). If present → return it.
+2. Check `Authorization: Bearer *** header (trimmed). If present → return the bearer token.
+3. Return empty string if neither found.
+
+### 27.3 `applyDefaultApiKeyMode(cfg *Config)`
+
+Called at the end of `LoadConfig`. If `cfg.ApiKeyMode` is empty, sets it to `"smart"`.
+
+### 27.4 `upstreamAPIKeyForDashboard() string`
+
+Returns the API key used for upstream dashboard calls (usage, concurrency, history fetching). Selection per mode:
+
+- **`passthrough`**: Return `getLastClientKey()`.
+- **`smart`**: Return `getLastClientKey()` if non-empty; otherwise fall through to pool.
+- **`managed`** (or smart with no client key): Acquire from `KeyPool.Acquire(-1)`, mark it healthy, return its key. Fall back to `Config.APIKey`, then `Config.APIKeys[0]`.
+
+### 27.5 Last-Known-Good Client Key Tracking
+
+The proxy maintains a single last-known-good client key (`lastClientKey` field on `Proxy`, protected by `lastClientKeyMu sync.RWMutex`):
+
+- **`setLastClientKey(key)`**: Records a client key. Called on successful upstream responses in passthrough/smart mode when `clientKey != ""`. No-op if key is empty.
+- **`getLastClientKey() string`**: Returns the last-known-good client key.
+
+### 27.6 Request Proxying Behavior (`usingClientKey` flag)
+
+Both `proxyChatRequest` (§19) and `proxyAnthropicRequest` (§20) use a `usingClientKey` boolean to skip pool operations:
+
+- If mode is `passthrough` or `smart` **and** `clientKey != ""`: `usingClientKey = true`. The client's key is set directly on the upstream client via `SetAPIKey()`. Pool acquire, mark healthy/unhealthy, and key rotation are all skipped.
+- If mode is `passthrough` with no client key: reject with 401.
+- Otherwise (managed, or smart/managed with no client key): acquire from pool as normal.
+
+### 27.7 Dashboard Exposure
+
+Both `HandleConfigGet` and `HandleConfigPost` expose and accept the field as `apikeyMode` (camelCase JSON). `HandleConfigPost` validates that the value is one of `smart`, `managed`, or `passthrough`.
 
 ---
 
@@ -1185,12 +1278,14 @@ Fetches the daily Bing wallpaper via the peapix.com API.
 
 1. Check cache: `.cache/wallpaper.jpg`. If file exists and was modified today, serve cached JPEG.
 2. If cache miss/expired:
-   - `GET https://peapix.com/bing/feed` with `User-Agent: Mozilla/5.0...` header, 15s timeout.
+   - `GET https://peapix.com/bing/feed` with browser `User-Agent`, 15s timeout.
    - Parse JSON response, extract first item's `fullUrl` (or `imageUrl` or `url`).
+   - **UHD upgrade**: Call `upgradePeapixResolution(imageURL)` to regex-replace the `_NNNN` suffix with `_3840` (3840×2160 UHD). Pattern: `_\d+\.(jpg|jpeg|png)$`.
    - Download the image (30s timeout, browser User-Agent).
+   - Validate: `isJPEG(imageData)` checks for `0xFF 0xD8` magic bytes.
    - Save to `.cache/wallpaper.jpg`.
    - Serve as `image/jpeg`.
-3. On fetch error: serve cached file if available, else 500.
+3. On fetch error: serve cached file if available, else 404.
 4. Set `Expires` header to end of today (UTC).
 
 Cache TTL: 24 hours (daily).
@@ -1201,14 +1296,33 @@ Fetches a random top-listed wallpaper from wallhaven.cc.
 
 1. Check cache: `.cache/wallpaper-haven.jpg`. If file exists and is < 1 hour old, serve cached JPEG.
 2. If cache miss/expired:
-   - `GET https://wallhaven.cc/api/v1/search?categories=100&purity=100&topRange=1M&sorting=toplist&order=desc&page=3` with `User-Agent: umans-proxy/1.0`, 15s timeout.
+   - `GET https://wallhaven.cc/api/v1/search?categories=100&purity=100&topRange=1M&sorting=toplist&order=desc&page=3&atleast=2560x1440` with `User-Agent: umans-proxy/1.0`, 15s timeout. The `atleast=2560x1440` parameter filters for high-resolution wallpapers.
    - Parse JSON, pick random entry from `data` array.
    - Download `path` URL (30s timeout, browser User-Agent).
+   - Validate: `isValidImage(imageData)` checks magic bytes for JPEG, PNG, or WebP (§30.3).
    - Save to `.cache/wallpaper-haven.jpg`.
-   - Serve as `image/jpeg`.
-3. On fetch error: serve cached file if available, else 500.
+   - Serve with correct content type via `serveWallpaperImageTyped()` + `imageContentType()`.
+3. On fetch error: serve cached file if available, else 404.
 
 Cache TTL: 1 hour.
+
+### 30.3 Image Format Utilities
+
+**`upgradePeapixResolution(imageURL) string`**: Regex-replaces `_NNNN` suffix (e.g. `_1920`) with `_3840` in peapix URLs for UHD output. Falls back to original URL if pattern doesn't match.
+
+**`isValidImage(data) bool`**: Validates freshly downloaded wallpapers by checking magic bytes:
+- JPEG: `0xFF 0xD8`
+- PNG: `0x89 0x50 0x4E 0x47` (`‰PNG`)
+- WebP: `0x52 0x49 0x46 0x46 ... 0x57 0x45 0x42 0x50` (`RIFF....WEBP`)
+
+**`imageContentType(data) string`**: Returns MIME type based on magic bytes:
+- PNG → `image/png`
+- WebP → `image/webp`
+- Default (including JPEG) → `image/jpeg`
+
+**`serveWallpaperImageTyped(w, data, expires, contentType)`**: Writes image data to response with caller-specified content type and optional `Expires` header.
+
+**`isJPEG(data) bool`**: Checks JPEG magic bytes (`0xFF 0xD8`) only. Used for Bing wallpaper validation.
 
 ---
 
@@ -1216,14 +1330,15 @@ Cache TTL: 1 hour.
 
 1. `loadConfig()` — Load `.config/config.json` + env var overrides.
 2. Initialize `ImageHandoffCache` (50 entries, 24h TTL or configured).
-3. Initialize `KeyPool` from `config.keys` (or single default key).
-4. Initialize `UpstreamClient`.
-5. `validateApiKey()` — Verify via `/v1/models/info`, populate `modelInfoMap` + `modelDisplayNameMap`.
-6. `fetchConcurrency()` — Fetch concurrent sessions & limit.
-7. `getModelsDevCatalog()` — Preload reasoning metadata (non-fatal on failure).
-8. `http.createServer(handleRequest).listen(port, "127.0.0.1")` — Start HTTP server with port-retry on `EADDRINUSE` (3 retries on same port, then increment port).
-9. `setupOpencodeConfig()` — Discover + write models to opencode configs, deferred 100ms after server starts listening.
-10. Graceful shutdown hooks (SIGINT, SIGTERM) — close server and exit.
+3. Restore burst mode from config: `setBurstMode(cfg.BurstMode)`.
+4. Initialize `KeyPool` from `config.keys` (or single default key).
+5. Initialize `UpstreamClient`.
+6. `validateApiKey()` — Verify via `/v1/models/info`, populate `modelInfoMap` + `modelDisplayNameMap`.
+7. `fetchConcurrency()` — Fetch concurrent sessions & limit.
+8. `getModelsDevCatalog()` — Preload reasoning metadata (non-fatal on failure).
+9. `http.createServer(handleRequest).listen(port, "127.0.0.1")` — Start HTTP server with port-retry on `EADDRINUSE` (3 retries on same port, then increment port).
+10. `setupOpencodeConfig()` — Discover + write models to opencode configs, deferred 100ms after server starts listening.
+11. Graceful shutdown hooks (SIGINT, SIGTERM) — close server and exit.
 
 ### 30.1 Port Retry
 
@@ -1240,23 +1355,29 @@ The dashboard is a standalone `dashboard.html` file, ported from the original Ja
 
 ### Dashboard serving specifics:
 - Read and cache by mtime.
-- Inject a `<style>` tag with a dark background (`#0d1117`) before `</head>`. If `wallpaperSource` is `bing` or `wallhaven` and a cached wallpaper exists, embed it as base64 `background-image` instead.
+- Inject a `<style>` tag with a dark background (`#0d1117`) before `</head>`. If `wallpaperSource` is `bing` or `wallhaven` and a cached wallpaper exists, embed it as base64 `background-image` with full background properties (`cover`, `no-repeat`, `center`, `fixed`, `background-color: #070912`) using the correct content type from `imageContentType()`.
 - Content-Type: `text/html`.
 
 ### Ported features:
 - 5-hour Window card (Requests, Throttled, Cached %, Error %, Start Time, Tokens In/Out, plan badge)
 - Current Concurrency card (Active, Queued, Limit, Burst, dual-fill progress bar with soft-cap/burst zones, upstream overlay, percentage, detail grid)
+- **Burst Mode toggle** (backend-gated via `BURST_MODE` config field): When Off, `gateLimit()` returns the soft cap (`limit`), and the concurrency bar scales to the soft cap. When On, `gateLimit()` returns the hard cap (`hard_cap`), the bar scales to hard cap, and shows both soft-cap (green) and burst (orange) zones with a gradient fill. Frontend `toggleBurstMode(enabled)` POSTs `{burstMode: enabled}` to `/api/config`, reverts the UI state if the response is not `r.ok`, and calls `fetchConcurrency()` on success. The initial state is read from the backend config (`cd.burstMode`) during `loadConfig()`.
 - Usage History card (bar chart with Y-axis labels, dashed grid lines, X-axis labels, click-to-filter table, expandable per-model breakdown, sortable headers, metric toggle Tokens/Requests, status legend)
 - User ID in header bar (click-to-reveal masking)
 - API Key section (key pool display with status badges, collapsible)
+- **API Key Mode toggle** (Smart/Managed/Pass-Through button group in Quick Settings). In `passthrough` mode, the API Key (token pool) card is hidden.
 - Models section (enable/disable toggle per model via `DISABLED_MODELS`, collapsible)
-- Quick Settings (Automatic Refresh interval, Wallpaper selector (None/Bing/Wallhaven), Vision Handoff toggle with info tooltip, Handoff Cache toggle (shown only when Vision Handoff is enabled) with cache stats line)
+- Quick Settings (Automatic Refresh interval, Wallpaper selector (None/Bing/Wallhaven), Burst Mode toggle, API Key Mode selector, Vision Handoff toggle with info tooltip, Handoff Cache toggle (shown only when Vision Handoff is enabled) with cache stats line)
 - Quick Actions (Check Health, Test Connection, Manual Refresh, Restart Proxy)
 - Environment (Runtime, Port, Started At)
 - Key Management Modal (add/edit/delete API keys with inline editing, account info with User ID)
 - Glass UI (procedural SVG filter-based glassmorphism via `initLiquidGlass()`)
-- Auto-refresh (status every 15s, usage via configurable interval, concurrency every 15s, usage history every 5 min)
+- **Unified refresh cycle**: `setRefreshInterval(seconds, skipImmediate)` controls all dashboard content (status, usage, concurrency, history) on a single interval. The selected interval is persisted in localStorage (`refreshInterval`, default 30s). Options: 30s, 1m, 2m, 5m. When `skipImmediate` is false (or omitted), changing the interval immediately triggers all fetches (`updateStatus`, `fetchUsage`, `fetchConcurrency`, `fetchHistory`). When `skipImmediate` is true, only the timer is set — used during init since `loadConfig` and `setHistoryRange` already fetch.
 - Dashboard always fetches usage and concurrency with `?fresh=1`
+- **Dashboard load performance**: `loadConfig()` fetches `/api/config` and `/api/models` in parallel; `/healthz` is fetched fire-and-forget in the background (not awaited) because it hits upstream and can be slow. The wallpaper loader is hidden before `fetchUsage()` (also fire-and-forget) so the dashboard renders as soon as config + models + wallpaper are ready. `fetchConcurrency()` is called on `DOMContentLoaded` (was previously missing, which delayed the concurrency display by up to 30s until the first refresh cycle).
+- **Wallpaper None fix**: `clearWallpaper()` uses `document.body.style.setProperty('background-image', 'none', 'important')` to override the server-injected `!important` CSS (the inline `<style>` tag injected by the Go binary for `wallpaperSource: "none"` or cached wallpapers).
+- **Chevron icon fix**: `toggleSection()` swaps `bi-chevron-down` ↔ `bi-chevron-right` Bootstrap Icons classes directly on the toggle icon element, rather than using CSS `transform: rotate()` rotation. This ensures the icon visually matches the expanded/collapsed state.
+- **Wallpaper init**: `setWallpaper(source, skipConfigSave)` accepts a second parameter to skip the redundant config POST during initial load (when the config was just fetched and the wallpaper source is already persisted).
 - Toast notifications
 - Bootstrap 5 + Bootstrap Icons (via CDN)
 
@@ -1316,10 +1437,14 @@ const (
     MAX_QUEUE_SIZE          = 256
     MAX_BODY_SIZE           = 5 * 1024 * 1024  // 5 MB
     CONVERSATION_MAP_MAX    = 10000
+    CONV_MAP_EVICT_TARGET   = 8000  // 80% of CONVERSATION_MAP_MAX
     MODEL_CATALOG_CACHE_TTL = 5 * time.Minute
     MODELS_DEV_CACHE_TTL   = 5 * time.Minute
     USAGE_CACHE_TTL        = 5 * time.Minute
     OPENCODE_CONFIG_CACHE_TTL = 5 * time.Minute
+    UPSTREAM_MODELS_CACHE_TTL = 5 * time.Minute
+    USER_INFO_CACHE_TTL     = 5 * time.Minute
+    USER_INFO_CACHE_TIMEOUT  = 10 * time.Second
 )
 ```
 

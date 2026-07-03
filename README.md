@@ -6,9 +6,7 @@ This is a Go port and opinionated customization of the original Node.js project 
 
 ![Dashboard](screenshots/dashboard-full.png)
 
-![Usage History with detail table](screenshots/usage-history.png)
-
-![Concurrency in burst mode](screenshots/concurrency-burst.png)
+![Dashboard with wallpaper](screenshots/dashboard-full-wallpaper.png)
 
 ## Features
 
@@ -16,10 +14,13 @@ This is a Go port and opinionated customization of the original Node.js project 
 - **Anthropic Messages API** — Pass-through for `/v1/messages` (Anthropic-compatible clients)
 - **Multi-Key Pool** — Round-robin key pool with unhealthy marking, cooldowns, and persistence across restarts
 - **Automatic Upstream Retry** — Retries failed requests on HTTP 500/503 and network failures up to 10 times with escalating backoff, rotating to a fresh key on each attempt
-- **Concurrency Queue** — Bounded request queue gated on burst capacity (hard_cap), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full
+- **Concurrency Queue** — Bounded request queue gated by Burst Mode (soft cap when Off, hard cap when On), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full
 - **Dashboard** — Clean UI with usage cards, concurrency monitoring, usage history chart with sortable tables, model management, key management, and configuration
-- **Bing Wallpaper** — Daily rotating backgrounds from Bing
-- **Wallhaven Wallpaper** — Optional backgrounds from Wallhaven
+- **API Key Mode** — Smart (default), Managed, or Pass-Through mode controlling which API key is used for upstream requests (client key vs. proxy key pool)
+- **Burst Mode** — Dashboard toggle that controls backend concurrency gating: Off gates at the soft cap (Limit), On gates at the hard cap (Burst); persisted in config and synced to the frontend
+- **Non-Blocking Config Updates** — Proxy request handlers snapshot config fields and release the config lock immediately, so settings changes complete instantly even during active LLM completions
+- **Bing Wallpaper** — Daily rotating UHD (3840px) backgrounds from Bing
+- **Wallhaven Wallpaper** — Optional high-resolution (≥2560×1440) backgrounds from Wallhaven with JPEG, PNG, and WebP support
 - **Automatic Image-Attachment Limit** — Caps vision/images per request; excess images are pruned oldest-first before forwarding to UMANS
 - **Vision Handoff** — Models that can't see images natively (e.g. GLM 5.2) automatically delegate image analysis to a vision-capable model (default `umans-coder`) and inject the text description into the session context
 - **Handoff Image Cache** — When vision handoff is enabled, caches image descriptions for 24 hours so repeated images skip re-analysis
@@ -143,14 +144,18 @@ const response = await client.messages.create({
 
 Open **http://127.0.0.1:8084** in your browser.
 
-### 5-hour Window Card
-- **Requests / Throttled / Cached %** — Current window usage with throttled (503 queue-full) count
-- Detail grid: Start Time, Tokens In, Tokens Out
+> **Unified refresh cycle:** Status, usage, concurrency, and history all refresh together on the user-selected Automatic Refresh interval. The interval is persisted in `localStorage` and restored on page load (default 30s).
 
 ### Current Concurrency Card
 - 4 stat cards: **Active** (green), **Queued** (blue), **Limit** (soft, yellow), **Burst** (hard cap, orange)
 - Progress bar with solid fill (proxy active) and dotted overlay (upstream concurrent)
-- Percentage scales to 100% at soft cap, 200% at hard cap
+- Bottom-border zone markers: yellow for soft-cap region, orange for burst region
+- When Burst Mode is **Off**, the backend gates at the soft cap (Limit) and the bar scales to match. When **On**, the backend gates at the hard cap (Burst) and the bar shows both zones with a green→orange gradient on the fill when active exceeds the soft cap
+- Percentage shows value relative to soft cap
+
+### 5-hour Window Card
+- **Requests / Throttled / Cached %** — Current window usage with throttled (503 queue-full) count
+- Detail grid: Start Time, Tokens In, Tokens Out
 
 ### Usage History Card
 - Bar chart with Y-axis labels, dashed grid lines, and X-axis labels
@@ -160,26 +165,55 @@ Open **http://127.0.0.1:8084** in your browser.
 - Metric toggle (Tokens/Requests) controls chart scale and default sort
 - Status legend shown only in Requests mode; hidden in Tokens mode
 
+### API Key (collapsed by default)
+- Key pool display with status badges; manage keys via modal
+- Hidden in Pass-Through mode (client keys are passed through directly)
+
 ### Quick Settings (expanded)
-- **Automatic Refresh** — 30s / 1m / 2m / 5m (=298s) interval selector
+- **Automatic Refresh** — 30s / 1m / 2m / 5m (=298s) interval selector; persisted to `localStorage`
 - **Wallpaper** — None / Bing / Wallhaven
+- **Burst Mode** — Off / On toggle; Off gates backend concurrency at the soft cap (Limit), On gates at the hard cap (Burst); persisted in config (`BURST_MODE`) and synced to the frontend on load
+- **API Key** — Smart / Managed / Pass-Through mode selector
 - **Vision Handoff** — Toggle image handoff for vision-incapable models
 - **Handoff Cache** — Toggle caching of vision handoff image analyses (shown only when Vision Handoff is enabled)
+- Sections collapse with a chevron icon that swaps between `bi-chevron-down` (expanded) and `bi-chevron-right` (collapsed)
 
-### Quick Actions (collapsed)
+### Quick Actions (expanded)
 - Health check, connection test, manual refresh, restart proxy
 
-### API Key (collapsed)
-- Key pool display with status badges; manage keys via modal
-
-### Models (collapsed)
+### Models (expanded)
 - View and toggle models from the catalog
 
-### Environment (collapsed)
+### Environment (expanded)
 - Runtime, Port, Started At
+
+### Wallpaper Rendering
+- Desktop: `background-size: cover` (fills the viewport)
+- Mobile (≤575px): `background-size: contain` (shows the full image centered)
+- Server-side CSS injection includes full background properties (`no-repeat`, `center`, `fixed`, base color)
 
 ### Header Bar
 - User ID (click-to-reveal, masked by default) and online status indicator
+
+### Mobile Layout
+- Right-column sections (Quick Settings, Quick Actions, API Key, Models, Environment) collapse by default on screens ≤575px
+
+## API Key Mode
+
+The proxy supports three modes for selecting which API key is sent to the upstream UMANS API on each request. The mode is configurable from the dashboard's Quick Settings panel and persisted in `config.json` via the `API_KEY_MODE` field.
+
+| Mode | Behavior | Authorization |
+|---|---|---|
+| **Smart** (default) | Uses the client's API key if one is provided in the request (`Authorization: Bearer <key>` or `X-Api-Key`); falls back to the proxy's own key pool if no client key is present | Accepts all requests |
+| **Managed** | Always uses the proxy's own key pool, ignoring any client-supplied key | Validates client requests against the `API_KEYS` allow-list (if configured); open if no allow-list is set |
+| **Pass-Through** | Always uses the client's API key, disabling the proxy's key management entirely | Accepts any request that includes an API key |
+
+**Dashboard upstream calls** (usage, concurrency, history) adapt to the active mode:
+- **Pass-Through**: uses the last-known-good client key
+- **Smart**: prefers the last-known-good client key, falls back to the pool key
+- **Managed**: uses the pool key
+
+The **API Key** card is hidden from the dashboard in Pass-Through mode.
 
 ## Vision Handoff
 
@@ -251,6 +285,8 @@ The built-in prompt instructs the handoff model to produce a factual, third-pers
 | `VISION_HANDOFF_CACHE_ENABLED` | Enable caching of vision handoff image analyses | `false` |
 | `VISION_HANDOFF_CACHE_TTL` | TTL for cached vision handoff analyses | `24h` |
 | `wallpaperSource` | Dashboard wallpaper source: `none`, `bing`, or `wallhaven` | `bing` |
+| `API_KEY_MODE` | API key selection mode: `smart`, `managed`, or `passthrough` | `smart` |
+| `BURST_MODE` | Burst mode toggle: `true` gates concurrency at the hard cap, `false` gates at the soft cap | `false` |
 
 ## Building and Development
 
