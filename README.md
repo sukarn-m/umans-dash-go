@@ -45,9 +45,30 @@ umans-dash-go/
 
 - **Single Go binary** — no Node.js runtime, no `npm install`, no `node_modules`
 - **Zero external dependencies** — uses only the Go standard library
-- **Excluded features:**
+- **Excluded features** (present in the upstream original, removed in this port):
   - FreeGen AI wallpaper generator (and `/api/bg-freegen` endpoint)
   - Sleev context-compression gateway
+  - Shell Guard (git-command blocking in tool-call responses)
+  - i18n autotranslation system (`/api/i18n`, `LOCALE` config)
+  - Response cache for non-streaming chat (`/api/cache`, `CACHE_TTL`/`CACHE_MAX_SIZE`/`CACHE_ENABLED`)
+  - UMANS app login (`EMAIL`/`PASSWORD`/`APP_SESSION`, `/api/umans/login`, `/api/umans/logout`)
+  - Per-model rate limit map (`RATE_LIMIT_MAP`)
+  - Test Chat panel in the dashboard
+  - SS Mode (screenshot-safe blur/masking)
+  - SVG-filter glassmorphism (replaced with CSS `backdrop-filter`)
+  - SQLite usage-history cache (`.cache/usage.db`)
+- **Added features** (not in the upstream original):
+  - API Key Mode (Smart / Managed / Pass-Through) controlling which key is sent upstream
+  - Burst Mode toggle (soft cap vs. hard cap concurrency gating), persisted to config
+  - Non-blocking config updates (request handlers snapshot config fields and release the lock immediately)
+  - Vision Handoff Image Cache (SHA-256 keyed LRU, 24h TTL, configurable)
+  - Models.dev integration for reasoning metadata and display-name enrichment
+  - Thinking payload normalization (`budgetTokens` → `budget_tokens` for UMANS Pydantic compatibility)
+  - `DISABLED_MODELS` config field to hide specific models from the catalog
+  - `/v1/models/info` endpoint exposing the raw upstream model catalog
+  - UHD Bing wallpaper (3840px peapix resolution upgrade)
+  - Wallhaven resolution filter (`atleast=2560x1440`) with JPEG/PNG/WebP content-type detection
+  - Redesigned dashboard UI (unified refresh cycle, concurrency card with burst-zone visualization, sortable usage history with per-model drill-down)
 - **Wallpaper sources:** `none`, `bing`, or `wallhaven` only
 - **Default listen address:** `127.0.0.1:8084` (the packaged systemd service runs on `127.0.0.1:34850`)
 

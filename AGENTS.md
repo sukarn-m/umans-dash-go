@@ -25,7 +25,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 ## Current State
 
 - **`proxy.go` + `types.go`** contain the full implementation of all proxy functions.
-- **`dashboard.html`** is the dashboard UI, ported from the JS proxy minus excluded features (FreeGen, Sleev, Shell Guard).
+- **`dashboard.html`** is the dashboard UI, ported from the JS proxy minus excluded features (see "Excluded from Original" below).
 
 ## Key Types (types.go)
 
@@ -187,13 +187,18 @@ Zero. Go standard library only.
 
 ## Excluded from Original
 
-- Sleev context-compression gateway
-- FreeGen AI wallpaper generation (including `/api/bg-freegen` endpoint)
-- i18n translation system (`/api/i18n` route, `I18N_STRINGS`, `HandleI18n` — dead code, fully removed)
+Features present in the upstream [Node.js original](https://github.com/notBlubbll/umans-dash) that were intentionally removed:
+
+- **Sleev context-compression gateway** — local gateway daemon, binary resolution, OAuth sign-in (`SLEEV_ENABLED`, `SLEEV_GATEWAY_*`)
+- **FreeGen AI wallpaper generation** — `/api/bg-freegen` endpoint, `FREEGEN_PROMPT`, WebSocket integration with freegen.app
+- **i18n translation system** — `/api/i18n` route, `I18N_STRINGS` catalog, `LOCALE` config, one-click autotranslate via `umans-flash`
+- **Shell Guard** — `isGitCommand()`, `sanitizeShellToolCall()`, blocking git commands in shell tool-call responses (streaming and non-streaming)
+- **Response Cache** — LRU cache for non-streaming chat responses (`ResponseCache`, `cacheKey()`, `CACHE_TTL`/`CACHE_MAX_SIZE`/`CACHE_ENABLED` config, `/api/cache` GET/DELETE endpoints)
+- **UMANS app login** — `EMAIL`/`PASSWORD`/`APP_SESSION` config, `loginToApp()`, `/api/umans/login` and `/api/umans/logout` endpoints, platform login modal
+- **Rate Limit Map** — `RATE_LIMIT_MAP`, `enforceRateLimit()`, per-model rate limit delays
+- **Test Chat panel** — streaming/context chat panel with model selector in the dashboard
+- **SS Mode** — screenshot-safe mode (blur on hover, jumbled user ID, masked email)
+- **Glass UI** — procedural SVG filter-based glassmorphism (`feDisplacementMap`, `feColorMatrix`); replaced with CSS `backdrop-filter`
+- **SQLite Usage Cache** — `.cache/usage.db` persistent cache for daily usage-history buckets (`node:sqlite`/`bun:sqlite`)
 - `Enqueue()` and `HandleRestartMock()` — dead code removed
 
-## Included from Original
-
-- Bing wallpaper proxy (`/api/bg`) — daily cache, peapix.com API
-- Wallhaven wallpaper proxy (`/api/bg-wallhaven`) — hourly cache, wallhaven.cc API
-- Dashboard HTML (full port minus excluded features)
