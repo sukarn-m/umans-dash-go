@@ -1058,6 +1058,7 @@
             const hdr = document.querySelector('[data-section="' + s + '"] .collapsible-header');
             if (sec && !sec.classList.contains('collapsed')) {
               sec.classList.add('collapsed');
+              sec.style.display = 'none'; // hide fully — CSS .collapsed only zeros height/padding
               if (icon) { icon.classList.add('collapsed'); icon.classList.remove('bi-chevron-down'); icon.classList.add('bi-chevron-right'); }
               if (hdr) hdr.setAttribute('aria-expanded', 'false');
             }
