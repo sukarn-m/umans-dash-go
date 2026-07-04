@@ -45,9 +45,7 @@ const (
 	ConvMapEvictTarget     = 8000  // 80% of ConvMapMax — eviction target when map is at capacity
 	UmansAPIBase           = "https://api.code.umans.ai/v1"
 	APIKeyEnvVar           = "UMANS_API_KEY"
-	ModelsDevCatalogURL    = "https://models.dev/api.json"
 	ModelCatalogCacheTTL   = 5 * time.Minute
-	ModelsDevCacheTTL      = 5 * time.Minute
 	UsageCacheTTL          = 5 * time.Minute
 	OpencodeConfigCacheTTL = 5 * time.Minute
 	UpstreamModelsCacheTTL = 5 * time.Minute // §8.7
@@ -83,12 +81,6 @@ var stripUmansPrefixRegex = regexp.MustCompile(`(?i)^Umans\s+`)
 // extractUserPromptPrefixRegex strips leading [/...] prefixes from user prompts.
 // Compiled once at package init, not on every call.
 var extractUserPromptPrefixRegex = regexp.MustCompile(`^\[[^\]]+\]\s*`)
-
-var (
-	modelsDevCache     map[string]interface{}
-	modelsDevCacheTime time.Time
-	modelsDevCacheMu   sync.Mutex
-)
 
 // NewProxy creates and initializes a new Proxy instance.
 // It initializes the error log file (§16.1) as part of startup.
@@ -149,9 +141,6 @@ func NewProxy(cfg *Config) *Proxy {
 	if p.Upstream != nil {
 		p.FetchConcurrency(false)
 	}
-
-	// §31 step 7: Fetch models.dev catalog (non-fatal).
-	getModelsDevCatalog()
 
 	return p
 }
@@ -809,19 +798,7 @@ func md5Hash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// ─── Models.dev (§9) ───────────────────────────────────────────────────────
-
-func DeriveModelsDevId(umansId string) string {
-	return strings.TrimPrefix(umansId, "umans-")
-}
-
-func UmansIdCandidates(umansId string) []string {
-	base := DeriveModelsDevId(umansId)
-	if base == umansId {
-		return []string{umansId}
-	}
-	return []string{umansId, base}
-}
+// ─── Reasoning Helpers ──────────────────────────────────────────────────────
 
 func ParseLevels(raw interface{}) []string {
 	if arr, ok := raw.([]interface{}); ok {
@@ -920,196 +897,6 @@ func ApplyAutoThink(payload map[string]interface{}, reasoningCaps interface{}) {
 			"type": "adaptive",
 		}
 	}
-}
-
-func BuildModelsDevIndex(catalog map[string]interface{}) map[string]ModelsDevEntry {
-	index := map[string]ModelsDevEntry{}
-	priorityOrder := []string{"umans-ai", "openai", "anthropic", "google", "mistral", "meta", "xai", "deepseek", "moonshotai", "zhipuai", "alibaba", "nvidia", "cohere", "minimax", "stepfun", "xiaomi"}
-	seen := map[string]bool{}
-	for _, p := range priorityOrder {
-		seen[p] = true
-	}
-	var allProviders []string
-	for p := range catalog {
-		if !seen[p] {
-			allProviders = append(allProviders, p)
-		}
-	}
-	sort.Strings(allProviders)
-	for _, providerID := range append(priorityOrder, allProviders...) {
-		provider, ok := catalog[providerID].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		models, ok := provider["models"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for modelID, model := range models {
-			if _, exists := index[modelID]; !exists {
-				index[modelID] = ModelsDevEntry{ProviderID: providerID, ModelID: modelID, Model: model}
-			}
-		}
-	}
-	return index
-}
-
-func fetchModelsDevCatalog() (map[string]interface{}, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", ModelsDevCatalogURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models.dev catalog returned status %d", resp.StatusCode)
-	}
-	body := io.LimitReader(resp.Body, 50*1024*1024) // 50 MB cap
-	var catalog map[string]interface{}
-	if err := json.NewDecoder(body).Decode(&catalog); err != nil {
-		return nil, fmt.Errorf("failed to decode models.dev catalog: %w", err)
-	}
-	return catalog, nil
-}
-
-func getModelsDevCatalog() map[string]interface{} {
-	modelsDevCacheMu.Lock()
-	defer modelsDevCacheMu.Unlock()
-	if modelsDevCache != nil && time.Since(modelsDevCacheTime) < ModelsDevCacheTTL {
-		return modelsDevCache
-	}
-	catalog, err := fetchModelsDevCatalog()
-	if err != nil {
-		log.Printf("models.dev catalog fetch failed (non-fatal): %v", err)
-		return nil
-	}
-	modelsDevCache = catalog
-	modelsDevCacheTime = time.Now()
-	return catalog
-}
-
-func findModelsDevEntry(catalog map[string]interface{}, umansId string) *ModelsDevEntry {
-	if catalog == nil {
-		return nil
-	}
-	candidates := UmansIdCandidates(umansId)
-	canonicalProviders := []string{
-		"openai", "anthropic", "google", "mistral", "meta",
-		"xai", "deepseek", "moonshotai", "zhipuai", "alibaba",
-		"nvidia", "cohere", "minimax", "stepfun", "xiaomi",
-	}
-
-	// Tier 1: umans-ai provider, direct model match
-	if provider, ok := catalog["umans-ai"].(map[string]interface{}); ok {
-		if models, ok := provider["models"].(map[string]interface{}); ok {
-			for _, candidate := range candidates {
-				if model, ok := models[candidate].(map[string]interface{}); ok {
-					return &ModelsDevEntry{
-						ProviderID: "umans-ai",
-						ModelID:    candidate,
-						Model:      model,
-					}
-				}
-			}
-		}
-	}
-
-	// Tier 2: canonical providers, direct model match
-	for _, providerID := range canonicalProviders {
-		provider, ok := catalog[providerID].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		models, ok := provider["models"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for _, candidate := range candidates {
-			if model, ok := models[candidate].(map[string]interface{}); ok {
-				return &ModelsDevEntry{
-					ProviderID: providerID,
-					ModelID:    candidate,
-					Model:      model,
-				}
-			}
-		}
-	}
-
-	// Tier 3: scan all providers for matching candidate ID
-	for providerID, providerRaw := range catalog {
-		provider, ok := providerRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		models, ok := provider["models"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for _, candidate := range candidates {
-			if model, ok := models[candidate].(map[string]interface{}); ok {
-				return &ModelsDevEntry{
-					ProviderID: providerID,
-					ModelID:    candidate,
-					Model:      model,
-				}
-			}
-		}
-	}
-
-	// Tier 4: match by nested model.id field
-	for providerID, providerRaw := range catalog {
-		provider, ok := providerRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		models, ok := provider["models"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for modelKey, modelRaw := range models {
-			model, ok := modelRaw.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if modelID, ok := model["id"].(string); ok {
-				for _, candidate := range candidates {
-					if modelID == candidate {
-						return &ModelsDevEntry{
-							ProviderID: providerID,
-							ModelID:    modelKey,
-							Model:      model,
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func resolveReasoningMode(devEntry *ModelsDevEntry, reasoningCaps interface{}) *bool {
-	if devEntry != nil {
-		if model, ok := devEntry.Model.(map[string]interface{}); ok {
-			if rawOpts, ok := model["reasoning_options"]; ok {
-				opts := ParseLevels(rawOpts)
-				if len(opts) > 0 {
-					t := true
-					return &t
-				}
-			}
-		}
-	}
-	if mode := InferReasoningModeFromCapabilities(reasoningCaps); mode != nil {
-		return mode
-	}
-	t := true
-	return &t
 }
 
 // ─── Model Catalog (§8) ────────────────────────────────────────────────────
@@ -3647,7 +3434,7 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 	// Parse the full response (includes concurrent_sessions, limits, user_id)
 	var fullResp struct {
 		Usage              UsageInfo     `json:"usage"`
-		Window             WindowInfo    `json:"window"`
+		Window             *WindowInfo  `json:"window"`
 		Plan               PlanInfo      `json:"plan"`
 		Limits             *UsageLimits  `json:"limits"`
 		UserID             string        `json:"user_id"`
@@ -3670,7 +3457,10 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 	}
 
 	// §6.1: Throttle reset on window change
-	newWindow := data.Window.StartedAt
+	var newWindow string
+	if data.Window != nil {
+		newWindow = data.Window.StartedAt
+	}
 
 	// Step 1: Read old ThrottledWindow under p.mu.RLock (snapshot)
 	p.mu.RLock()
@@ -4023,21 +3813,20 @@ func (p *Proxy) SetupOpencodeConfig(homeDir string, port int) bool {
 			continue
 		}
 		models := map[string]interface{}{}
-		modelsDevCatalog := getModelsDevCatalog()
 		for _, m := range p.GetEffectiveModels() {
 			info := p.ModelInfoMap[m]
 			dn := p.DisplayNameMap[m]
-			var devEntry *ModelsDevEntry
-			if modelsDevCatalog != nil {
-				devEntry = findModelsDevEntry(modelsDevCatalog, m)
-			}
 			if dn == "" {
 				dn = strings.TrimPrefix(m, "umans-")
+			}
+			reasoning := true
+			if mode := InferReasoningModeFromCapabilities(info.Capabilities.Reasoning); mode != nil {
+				reasoning = *mode
 			}
 			entry := map[string]interface{}{
 				"id":          m,
 				"name":        dn,
-				"reasoning":   *resolveReasoningMode(devEntry, info.Capabilities.Reasoning),
+				"reasoning":   reasoning,
 				"temperature": true,
 			}
 			if cw, ok := toInt(info.Capabilities.ContextWindow); ok && cw > 0 {

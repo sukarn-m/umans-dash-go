@@ -164,7 +164,7 @@ type PlanInfo struct {
 // that are needed by fetchConcurrency() (§6.2).
 type UsageData struct {
 	Usage              UsageInfo     `json:"usage"`
-	Window             WindowInfo    `json:"window"`
+	Window             *WindowInfo  `json:"window"`
 	Plan               PlanInfo      `json:"plan"`
 	ConcurrentSessions int           `json:"concurrent_sessions"` // §6.2
 	Limits             *UsageLimits  `json:"limits"`              // §6.2
@@ -321,13 +321,6 @@ type HttpErrorRecord struct {
 	UpstreamStatus     int                 `json:"upstreamStatus"`
 	UpstreamStatusText string              `json:"upstreamStatusText"`
 	UpstreamBody       string              `json:"upstreamBody"` // already redacted
-}
-
-// ModelsDevEntry holds a resolved models.dev catalog entry.
-type ModelsDevEntry struct {
-	ProviderID string
-	ModelID   string
-	Model     interface{}
 }
 
 // ConversationSession tracks a conversation's key affinity and request count.

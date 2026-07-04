@@ -296,7 +296,7 @@ Each dispatched request increments `activeRequests`, and decrements it on comple
 - 5-minute cache TTL (`usageCache`).
 - `fresh = true` bypasses cache.
 - On non-OK response, returns cached data (if any) or nil.
-- **Throttle reset**: When the usage window changes (detected via `window.started_at`), resets `ThrottledCount` to 0 under `queueMu.Lock()` and updates `throttledWindowStart`. The lock block is split so that HTTP fetching and JSON parsing happen **outside** the lock, avoiding nested/long-held locks.
+- **Throttle reset**: When the usage window changes (detected via `window.started_at`), resets `ThrottledCount` to 0 under `queueMu.Lock()` and updates `throttledWindowStart`. The lock block is split so that HTTP fetching and JSON parsing happen **outside** the lock, avoiding nested/long-held locks. The `Window` field is nullable (`*WindowInfo`); when `nil`, there is no current window and the reset is skipped.
 
 ### 6.2 `fetchConcurrency(fresh bool)`
 
@@ -418,52 +418,18 @@ Same as `getOrderedModelIds()` (without the disabled filter). Falls back to `con
 
 ---
 
-## 9. Models.dev Integration
+## 9. Reasoning Helpers
 
-### 9.1 `fetchModelsDevCatalog()`
-
-- `GET https://models.dev/api.json` (no auth).
-- 15-second timeout.
-- Returns parsed JSON.
-
-### 9.2 `getModelsDevCatalog()`
-
-- 5-minute cache (`modelsDevCache`).
-- On failure, logs and returns `nil` (non-fatal).
-
-### 9.3 Model ID Resolution
-
-`deriveModelsDevId(umansId)`: Strips `umans-` prefix.
-
-`umansIdCandidates(umansId)`: Returns `[umansId, baseId]` where `baseId` is the stripped version (deduplicated).
-
-### 9.4 `findModelsDevEntry(catalog, umansId)`
-
-Search order (first match wins):
-1. `catalog["umans-ai"].models[candidate]`
-2. Canonical providers: `openai`, `anthropic`, `google`, `mistral`, `meta`, `xai`, `deepseek`, `moonshotai`, `zhipuai`, `alibaba`, `nvidia`, `cohere`, `minimax`, `stepfun`, `xiaomi`
-3. Fallback: scan every provider for matching candidate ID
-4. Last resort: match by nested `model.id` field
-
-Returns `{providerId, modelId, model}` or `nil`.
-
-### 9.5 `buildModelsDevIndex(catalog)`
-
-Builds a flat index: `modelId → {providerId, modelId, model}`. Priority order: `umans-ai` first, then canonical providers, then all others. First provider to claim a model ID wins.
-
-### 9.6 Reasoning Resolution
+### 9.1 Reasoning Resolution
 
 **`inferReasoningModeFromCapabilities(reasoningCaps)`**:
 - If `supported == true` → `true`
 - If `levels` array is non-empty → `true`
 - Otherwise → `nil`
 
-**`resolveReasoningMode(devEntry, reasoningCaps)`**:
-- If `devEntry` has non-empty `reasoning_options` array → `true`
-- Else use `inferReasoningModeFromCapabilities`
-- Default: `true`
+Callers default to `true` when this returns `nil`.
 
-### 9.7 Reasoning Level Budgets
+### 9.2 Reasoning Level Budgets
 
 ```go
 var ReasoningLevelBudgets = map[string]int{
@@ -474,13 +440,13 @@ var ReasoningLevelBudgets = map[string]int{
 }
 ```
 
-### 9.8 `buildReasoningVariants(reasoningCaps)`
+### 9.3 `buildReasoningVariants(reasoningCaps)`
 
 - Returns `nil` if `supported != true` or `can_disable == false`.
 - For each level in `levels` (excluding `"none"`), if a budget exists, creates a variant: `{thinking: {type: "enabled", budget_tokens: budget}}`.
 - Returns the variants map or `nil` if no valid levels.
 
-### 9.9 `parseLevels(raw)`
+### 9.4 `parseLevels(raw)`
 
 - If array: filter to non-empty strings.
 - If string: split on whitespace, filter empty.
@@ -1066,9 +1032,9 @@ Debounced 500ms. Prevents concurrent runs via a `pending` flag.
 For each discovered `opencode.json`:
 
 1. Build models map from `getEffectiveModels()`:
-   - For each model, look up `modelInfoMap` and `modelsDevIndex`.
+   - For each model, look up `modelInfoMap`.
    - Entry: `{id, name, reasoning, variants?, limit?, temperature: true, tool_call?, attachment?, modalities}`.
-   - `reasoning`: from `resolveReasoningMode`.
+   - `reasoning`: from `inferReasoningModeFromCapabilities` (default `true` when it returns `nil`).
    - `variants`: from `buildReasoningVariants`.
    - `limit`: `{context, output}` if context_window is available.
    - `tool_call`: `caps.supports_tools` if boolean.
@@ -1235,6 +1201,8 @@ Returns:
 }
 ```
 
+- `window` may be `null` when no usage window is active; the dashboard renders a `--` placeholder for Start Time in that case.
+
 - `?fresh=1` bypasses cache.
 - `throttled` is the proxy-side count of 503 queue-full rejections.
 
@@ -1335,10 +1303,9 @@ Cache TTL: 1 hour.
 5. Initialize `UpstreamClient`.
 6. `validateApiKey()` — Verify via `/v1/models/info`, populate `modelInfoMap` + `modelDisplayNameMap`.
 7. `fetchConcurrency()` — Fetch concurrent sessions & limit.
-8. `getModelsDevCatalog()` — Preload reasoning metadata (non-fatal on failure).
-9. `http.createServer(handleRequest).listen(port, "127.0.0.1")` — Start HTTP server with port-retry on `EADDRINUSE` (3 retries on same port, then increment port).
-10. `setupOpencodeConfig()` — Discover + write models to opencode configs, deferred 100ms after server starts listening.
-11. Graceful shutdown hooks (SIGINT, SIGTERM) — close server and exit.
+8. `http.createServer(handleRequest).listen(port, "127.0.0.1")` — Start HTTP server with port-retry on `EADDRINUSE` (3 retries on same port, then increment port).
+9. `setupOpencodeConfig()` — Discover + write models to opencode configs, deferred 100ms after server starts listening.
+10. Graceful shutdown hooks (SIGINT, SIGTERM) — close server and exit.
 
 ### 30.1 Port Retry
 
@@ -1377,6 +1344,7 @@ The dashboard is a standalone `dashboard.html` file, ported from the original Ja
 - **Dashboard load performance**: `loadConfig()` fetches `/api/config` and `/api/models` in parallel; `/healthz` is fetched fire-and-forget in the background (not awaited) because it hits upstream and can be slow. The wallpaper loader is hidden before `fetchUsage()` (also fire-and-forget) so the dashboard renders as soon as config + models + wallpaper are ready. `fetchConcurrency()` is called on `DOMContentLoaded` (was previously missing, which delayed the concurrency display by up to 30s until the first refresh cycle).
 - **Wallpaper None fix**: `clearWallpaper()` uses `document.body.style.setProperty('background-image', 'none', 'important')` to override the server-injected `!important` CSS (the inline `<style>` tag injected by the Go binary for `wallpaperSource: "none"` or cached wallpapers).
 - **Chevron icon fix**: `toggleSection()` swaps `bi-chevron-down` ↔ `bi-chevron-right` Bootstrap Icons classes directly on the toggle icon element, rather than using CSS `transform: rotate()` rotation. This ensures the icon visually matches the expanded/collapsed state.
+- **Animated section collapse/expand**: `toggleSection()` drives a JS height transition (`scrollHeight` → `0` on collapse, `0` → `scrollHeight` on expand) over 300ms. CSS `.collapse-section.collapsed` sets `height:0;opacity:0;padding:0`; `display:none` is applied inline by JS after the `transitionend` event fires, so the collapse animation is visible (instant `display:none` in CSS would skip it). Pre-collapsed sections get `display:none` on `DOMContentLoaded`.
 - **Wallpaper init**: `setWallpaper(source, skipConfigSave)` accepts a second parameter to skip the redundant config POST during initial load (when the config was just fetched and the wallpaper source is already persisted).
 - Toast notifications
 - Bootstrap 5 + Bootstrap Icons (via CDN)
@@ -1431,7 +1399,6 @@ On `/api/restart`:
 const (
     UMANS_API_BASE          = "https://api.code.umans.ai/v1"
     API_KEY_ENV_VAR         = "UMANS_API_KEY"
-    MODELS_DEV_CATALOG_URL  = "https://models.dev/api.json"
     MAX_RETRIES             = 10
     RETRY_DELAY_MS          = 3000  // 3 seconds
     MAX_QUEUE_SIZE          = 256
@@ -1439,7 +1406,6 @@ const (
     CONVERSATION_MAP_MAX    = 10000
     CONV_MAP_EVICT_TARGET   = 8000  // 80% of CONVERSATION_MAP_MAX
     MODEL_CATALOG_CACHE_TTL = 5 * time.Minute
-    MODELS_DEV_CACHE_TTL   = 5 * time.Minute
     USAGE_CACHE_TTL        = 5 * time.Minute
     OPENCODE_CONFIG_CACHE_TTL = 5 * time.Minute
     UPSTREAM_MODELS_CACHE_TTL = 5 * time.Minute
@@ -1457,5 +1423,3 @@ var ReasoningLevelBudgets = map[string]int{
 }
 ```
 
-Canonical models.dev providers (in priority order):
-`umans-ai`, `openai`, `anthropic`, `google`, `mistral`, `meta`, `xai`, `deepseek`, `moonshotai`, `zhipuai`, `alibaba`, `nvidia`, `cohere`, `minimax`, `stepfun`, `xiaomi`.

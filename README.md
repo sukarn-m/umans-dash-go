@@ -62,7 +62,6 @@ umans-dash-go/
   - Burst Mode toggle (soft cap vs. hard cap concurrency gating), persisted to config
   - Non-blocking config updates (request handlers snapshot config fields and release the lock immediately)
   - Vision Handoff Image Cache (SHA-256 keyed LRU, 24h TTL, configurable)
-  - Models.dev integration for reasoning metadata and display-name enrichment
   - Thinking payload normalization (`budgetTokens` → `budget_tokens` for UMANS Pydantic compatibility)
   - `DISABLED_MODELS` config field to hide specific models from the catalog
   - `/v1/models/info` endpoint exposing the raw upstream model catalog
@@ -70,7 +69,7 @@ umans-dash-go/
   - Wallhaven resolution filter (`atleast=2560x1440`) with JPEG/PNG/WebP content-type detection
   - Redesigned dashboard UI (unified refresh cycle, concurrency card with burst-zone visualization, sortable usage history with per-model drill-down)
 - **Wallpaper sources:** `none`, `bing`, or `wallhaven` only
-- **Default listen address:** `127.0.0.1:8084` (the packaged systemd service runs on `127.0.0.1:34850`)
+- **Default listen address:** `127.0.0.1:8084`
 
 ## Quick Start
 

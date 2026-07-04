@@ -40,7 +40,6 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 | `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types |
 | `ConcurrencyData` | Concurrency limits and current state |
 | `ImagePart` | An image found in a request payload (for vision handoff) |
-| `ModelsDevEntry` | A resolved models.dev catalog entry |
 
 ## Key Functions (proxy.go)
 
@@ -91,13 +90,10 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `FingerprintPayload(payload) string` — MD5 hash of first user message, 12 chars
 - `MsgText(m) string` / `ExtractUserPrompt(payload) string`
 
-### Models.dev (§9)
-- `DeriveModelsDevId(umansId string) string` — strips "umans-" prefix
-- `UmansIdCandidates(umansId string) []string`
+### Reasoning Helpers (§9)
 - `ParseLevels(raw interface{}) []string`
 - `InferReasoningModeFromCapabilities(reasoningCaps) *bool`
 - `BuildReasoningVariants(reasoningCaps) map[string]interface{}`
-- `BuildModelsDevIndex(catalog) map[string]ModelsDevEntry`
 
 ### Error Logging (§16)
 - `RedactHeaders(headers map[string][]string) map[string][]string`
@@ -152,7 +148,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - **Burst Mode toggle** — POSTs `burstMode` boolean to backend (`/api/config`) instead of using localStorage; backend persists to `Config.BurstMode` and calls `setBurstMode()`
 - `setWallpaper(src, skipConfigSave)` — `skipConfigSave` parameter avoids redundant POST during init
 - `loadConfig()` — decoupled from `/healthz` (fetched in background, not awaited); hides loader before `fetchUsage()` (fire-and-forget)
-- `toggleSection()` — swaps `bi-chevron-down` ↔ `bi-chevron-right` icon classes instead of CSS transform
+- `toggleSection()` — animates section collapse/expand via JS-driven height transition (`scrollHeight` → `0` and back); swaps `bi-chevron-down` ↔ `bi-chevron-right` icon classes. CSS `.collapsed` sets `height:0;opacity:0;padding:0`; `display:none` is applied inline by JS only after `transitionend` fires, so the collapse animation is visible
 - `clearWallpaper()` — uses `setProperty(..., 'important')` to override server-injected `!important` CSS
 - **Unified refresh cycle** — all content (status, usage, concurrency, history) on one timer, persisted to localStorage
 - `fetchConcurrency()` — called on init (was missing previously)
