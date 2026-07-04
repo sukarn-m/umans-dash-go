@@ -44,9 +44,9 @@
       background:linear-gradient(180deg, rgba(7,9,18,0.4), rgba(7,9,18,0.6));
       pointer-events:none;
     }
-    /* Mobile: show full wallpaper centered (contain) instead of filling (cover) */
+    /* Mobile: fill viewport with wallpaper (cover) like desktop */
     @media(max-width:575px) {
-      body.has-wallpaper { background-size:contain !important; }
+      body.has-wallpaper { background-size:cover !important; }
     }
     .dashboard-container {
       position:relative; z-index:10; max-width:1180px;
