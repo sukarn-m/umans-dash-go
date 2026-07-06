@@ -52,7 +52,21 @@ type Config struct {
 	VisionHandoffCacheTtl   Duration          `json:"VISION_HANDOFF_CACHE_TTL"`
 	WallpaperSource         string            `json:"wallpaperSource"`
 	ApiKeyMode              string            `json:"API_KEY_MODE"` // "smart" (default), "managed", or "passthrough"
-	BurstMode               bool              `json:"BURST_MODE"`
+	// ConcurrencyLimitMode controls which cap gates concurrency:
+	//   "soft"   → gate at Limit (soft cap)        [default, same as old BurstMode=false]
+	//   "hard"   → gate at HardCap (hard cap)       [same as old BurstMode=true]
+	//   "manual" → gate at ManualConcurrencyLimit   [user-specified via slider]
+	ConcurrencyLimitMode  string `json:"CONCURRENCY_LIMIT_MODE"`
+	// ManualConcurrencyLimit is the user-chosen gate value when mode == "manual".
+	// Default 0 = uninitialized; gateLimit() falls back to soft cap.
+	ManualConcurrencyLimit int `json:"MANUAL_CONCURRENCY_LIMIT"`
+	// BurstMode is DEPRECATED — kept for config migration + rollback safety.
+	// Synced in HandleConfigPost: true when mode=="hard", false otherwise.
+	BurstMode bool `json:"BURST_MODE"`
+	// SlotFreeDelay is the delay (in seconds) before freeing a concurrency slot
+	// after a request completes. 0 = immediate (default). Useful to avoid
+	// hitting upstream rate limits when requests complete in rapid succession.
+	SlotFreeDelay int `json:"SLOT_FREE_DELAY"`
 }
 
 // Duration is a wrapper around time.Duration that can be JSON-serialized.
@@ -408,6 +422,7 @@ type Proxy struct {
 	KeyPool         *KeyPool
 	ImageHandoffCache *ImageHandoffCache
 	StartedAt       time.Time
+	Version         string
 	ModelInfoMap    map[string]ModelInfo
 	DisplayNameMap  map[string]string
 	DisabledModels  []string
@@ -478,10 +493,11 @@ type Proxy struct {
 	lastClientKeyMu sync.RWMutex
 	lastClientKey   string
 
-	// Burst mode: when false, gateLimit() returns the soft cap (Limit).
-	// When true, returns the hard cap (HardCap) if available, else Limit.
-	burstModeMu sync.RWMutex
-	burstMode   bool
+	// Concurrency limit mode + manual limit, protected by concurrencyLimitMu.
+	// gateLimit() takes one RLock and reads both fields atomically.
+	concurrencyLimitMu   sync.RWMutex
+	concurrencyLimitMode string
+	manualLimit          int
 }
 
 // responseWriterTracker wraps an http.ResponseWriter to track whether

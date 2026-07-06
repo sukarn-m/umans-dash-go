@@ -14,10 +14,10 @@ This is a Go port and opinionated customization of the original Node.js project 
 - **Anthropic Messages API** — Pass-through for `/v1/messages` (Anthropic-compatible clients)
 - **Multi-Key Pool** — Round-robin key pool with unhealthy marking, cooldowns, and persistence across restarts
 - **Automatic Upstream Retry** — Retries failed requests on HTTP 500/503 and network failures up to 10 times with escalating backoff, rotating to a fresh key on each attempt
-- **Concurrency Queue** — Bounded request queue gated by Burst Mode (soft cap when Off, hard cap when On), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full
+- **Concurrency Queue** — Bounded request queue gated by Concurrency Limit mode (Soft Cap, Hard Cap, or Manual with a custom slider), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full. A configurable Slot Free Delay (seconds) can pause before freeing a slot after request completion to avoid upstream rate limits
 - **Dashboard** — Clean UI with usage cards, concurrency monitoring, usage history chart with sortable tables, model management, key management, and configuration
 - **API Key Mode** — Smart (default), Managed, or Pass-Through mode controlling which API key is used for upstream requests (client key vs. proxy key pool)
-- **Burst Mode** — Dashboard toggle that controls backend concurrency gating: Off gates at the soft cap (Limit), On gates at the hard cap (Burst); persisted in config and synced to the frontend
+- **Empty Stream Detection** — Detects when upstream returns HTTP 200 + `text/event-stream` but sends zero data bytes, and treats it as a retryable error (up to 10 retries with escalating backoff) instead of forwarding an empty stream to the client
 - **Non-Blocking Config Updates** — Proxy request handlers snapshot config fields and release the config lock immediately, so settings changes complete instantly even during active LLM completions
 - **Bing Wallpaper** — Daily rotating UHD (3840px) backgrounds from Bing
 - **Wallhaven Wallpaper** — Optional high-resolution (≥2560×1440) backgrounds from Wallhaven with JPEG, PNG, and WebP support
@@ -59,7 +59,9 @@ umans-dash-go/
   - SQLite usage-history cache (`.cache/usage.db`)
 - **Added features** (not in the upstream original):
   - API Key Mode (Smart / Managed / Pass-Through) controlling which key is sent upstream
-  - Burst Mode toggle (soft cap vs. hard cap concurrency gating), persisted to config
+  - Concurrency Limit mode (Soft Cap / Hard Cap / Manual with slider), persisted to config
+  - Slot Free Delay (configurable delay before freeing a concurrency slot)
+  - Empty SSE stream detection and retry (prevents "empty stream" client errors)
   - Non-blocking config updates (request handlers snapshot config fields and release the lock immediately)
   - Vision Handoff Image Cache (SHA-256 keyed LRU, 24h TTL, configurable)
   - Thinking payload normalization (`budgetTokens` → `budget_tokens` for UMANS Pydantic compatibility)
@@ -170,8 +172,8 @@ Open **http://127.0.0.1:8084** in your browser.
 - 4 stat cards: **Active** (green), **Queued** (blue), **Limit** (soft, yellow), **Burst** (hard cap, orange)
 - Progress bar with solid fill (proxy active) and dotted overlay (upstream concurrent)
 - Bottom-border zone markers: yellow for soft-cap region, orange for burst region
-- When Burst Mode is **Off**, the backend gates at the soft cap (Limit) and the bar scales to match. When **On**, the backend gates at the hard cap (Burst) and the bar shows both zones with a green→orange gradient on the fill when active exceeds the soft cap
-- Percentage shows value relative to soft cap
+- The progress bar scales to the effective gate (`barMax`): Soft Cap → `limit`, Hard Cap → `hard_cap`, Manual → `manualLimit`. Zones (green→orange gradient) are shown when `barMax > limit`
+- Percentage shows value relative to the effective gate
 
 ### 5-hour Window Card
 - **Requests / Throttled / Cached %** — Current window usage with throttled (503 queue-full) count
@@ -192,7 +194,8 @@ Open **http://127.0.0.1:8084** in your browser.
 ### Quick Settings (expanded)
 - **Automatic Refresh** — 30s / 1m / 2m / 5m (=298s) interval selector; persisted to `localStorage`
 - **Wallpaper** — None / Bing / Wallhaven
-- **Burst Mode** — Off / On toggle; Off gates backend concurrency at the soft cap (Limit), On gates at the hard cap (Burst); persisted in config (`BURST_MODE`) and synced to the frontend on load
+- **Concurrency Limit** — Soft Cap / Hard Cap / Manual selector. Manual reveals a slider (1 to hard cap) for a custom concurrency limit. Persisted in config (`CONCURRENCY_LIMIT_MODE`, `MANUAL_CONCURRENCY_LIMIT`)
+- **Slot Free Delay** — Positive integer (seconds, default 0) that delays freeing a concurrency slot after a request completes. Persisted in config (`SLOT_FREE_DELAY`)
 - **API Key** — Smart / Managed / Pass-Through mode selector
 - **Vision Handoff** — Toggle image handoff for vision-incapable models
 - **Handoff Cache** — Toggle caching of vision handoff image analyses (shown only when Vision Handoff is enabled)
@@ -306,7 +309,10 @@ The built-in prompt instructs the handoff model to produce a factual, third-pers
 | `VISION_HANDOFF_CACHE_TTL` | TTL for cached vision handoff analyses | `24h` |
 | `wallpaperSource` | Dashboard wallpaper source: `none`, `bing`, or `wallhaven` | `bing` |
 | `API_KEY_MODE` | API key selection mode: `smart`, `managed`, or `passthrough` | `smart` |
-| `BURST_MODE` | Burst mode toggle: `true` gates concurrency at the hard cap, `false` gates at the soft cap | `false` |
+| `CONCURRENCY_LIMIT_MODE` | Concurrency gating mode: `soft` (soft cap), `hard` (hard cap), or `manual` (custom via slider) | `soft` |
+| `MANUAL_CONCURRENCY_LIMIT` | Custom concurrency limit when mode is `manual` (0 = auto-initialize to soft cap on first use) | `0` |
+| `SLOT_FREE_DELAY` | Delay in seconds before freeing a concurrency slot after a request completes (0 = immediate) | `0` |
+| `BURST_MODE` | Deprecated. Kept for config migration + rollback safety. `true` when mode is `hard`, `false` otherwise | `false` |
 
 ## Building and Development
 

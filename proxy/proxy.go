@@ -102,8 +102,19 @@ func NewProxy(cfg *Config) *Proxy {
 	}
 	p.ImageHandoffCache = NewImageHandoffCache(50, handoffTtl)
 
-	// Restore burst mode from config
-	p.setBurstMode(cfg.BurstMode)
+	// Restore concurrency limit mode from config (with migration from old BurstMode).
+	mode := cfg.ConcurrencyLimitMode
+	if mode == "" {
+		if cfg.BurstMode {
+			mode = "hard"
+		} else {
+			mode = "soft"
+		}
+	}
+	p.setConcurrencyLimitMode(mode)
+	if cfg.ManualConcurrencyLimit > 0 {
+		p.setManualLimit(cfg.ManualConcurrencyLimit)
+	}
 
 	// §31 step 3: Initialize KeyPool.
 	if len(cfg.Keys) > 0 {
@@ -222,6 +233,7 @@ func DefaultConfig() Config {
 		VisionHandoffCacheEnabled: false,
 		VisionHandoffCacheTtl:  ParseDuration("24h"),
 		WallpaperSource:        "bing",
+		ConcurrencyLimitMode:  "soft",
 	}
 }
 
@@ -2496,37 +2508,43 @@ func readBodyText(body io.ReadCloser) (string, error) {
 	return string(buf), nil
 }
 
-func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Request) error {
+// pipeBodyToResponse copies the upstream response body to the client,
+// flushing after each write. Returns the number of bytes written.
+// If 0 bytes were written (empty stream), the caller can detect this
+// and retry the request.
+func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Request) (int, error) {
 	if body == nil {
-		return fmt.Errorf("pipeBodyToResponse: body is nil")
+		return 0, fmt.Errorf("pipeBodyToResponse: body is nil")
 	}
 	defer body.Close()
 
 	ctx := r.Context()
 	flusher, _ := w.(http.Flusher)
 
+	totalWritten := 0
 	chunk := make([]byte, 4096)
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("pipeBodyToResponse: client disconnected: %w", ctx.Err())
+			return totalWritten, fmt.Errorf("pipeBodyToResponse: client disconnected: %w", ctx.Err())
 		default:
 		}
 
 		n, err := body.Read(chunk)
 		if n > 0 {
 			if _, werr := w.Write(chunk[:n]); werr != nil {
-				return fmt.Errorf("pipeBodyToResponse: write to client failed: %w", werr)
+				return totalWritten, fmt.Errorf("pipeBodyToResponse: write to client failed: %w", werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
+			totalWritten += n
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return totalWritten, nil
 			}
-			return fmt.Errorf("pipeBodyToResponse: read from upstream: %w", err)
+			return totalWritten, fmt.Errorf("pipeBodyToResponse: read from upstream: %w", err)
 		}
 	}
 }
@@ -2985,10 +3003,50 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 
 		if strings.Contains(contentType, "text/event-stream") {
 			// ── SSE streaming response ──
+			// Peek at the first chunk to detect empty streams before committing
+			// headers to the client. If upstream returns 200 + text/event-stream
+			// but sends 0 data bytes, treat it as a retryable error.
+			peekBuf := make([]byte, 4096)
+			peekN, peekErr := resp.Body.Read(peekBuf)
+
+			if peekN == 0 && (peekErr == nil || errors.Is(peekErr, io.EOF)) {
+				// Empty SSE stream — retry if possible
+				resp.Body.Close()
+				lastStatus = 502
+				if p.KeyPool != nil {
+					p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
+				}
+				_ = p.LogRetryableError(
+					attempt, isLast,
+					sessNum, slotName,
+					r.Method, r.URL.String(),
+					map[string][]string(r.Header), string(bodyBytes),
+					cfgUpstreamURL+"/chat/completions", "POST",
+					map[string][]string(resp.Header), 502, "Bad Gateway",
+					"empty SSE stream (0 bytes received)",
+				)
+				if isLast {
+					if writePassthroughError != nil {
+						writePassthroughError(w, http.StatusBadGateway,
+							`{"error":{"message":"upstream returned empty stream","type":"upstream_error"}}`)
+					}
+					return false, nil
+				}
+				return true, nil
+			}
+
+			// We have data — commit SSE headers and write the peeked bytes
 			if w.Header().Get("Content-Type") != "text/event-stream" {
 				writeSSEHeaders(w)
 			}
-			pipeBodyToResponse(resp.Body, w, r)
+			if peekN > 0 {
+				w.Write(peekBuf[:peekN])
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+			// Pipe the rest of the body
+			_, _ = pipeBodyToResponse(resp.Body, w, r)
 		} else {
 			// ── JSON response ──
 			respBody, readErr := readBodyText(resp.Body)
@@ -3210,7 +3268,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	w.WriteHeader(resp.StatusCode)
 
 	// Pipe body to response (handles both streaming and non-streaming)
-	_ = pipeBodyToResponse(resp.Body, w, r)
+	_, _ = pipeBodyToResponse(resp.Body, w, r)
 }
 
 // dispatchQueuedItem sends a queued item to the appropriate pipeline function.
@@ -3235,14 +3293,46 @@ func (p *Proxy) dispatchQueuedItem(item QueueItem) {
 	}
 }
 
-// gateLimit returns the effective concurrency gate (hard_cap ?? limit).
+// gateLimit returns the effective concurrency gate based on the concurrency limit mode.
 // Returns -1 if no gate applies (both hard_cap and limit are nil).
 // Caller must NOT hold queueMu — this method does not acquire it.
 func (p *Proxy) gateLimit() int {
 	eff := p.GetEffectiveConcurrency(p.LastConcurrency)
-	// Burst mode off → gate at soft cap (Limit).
-	// Burst mode on → gate at hard cap (HardCap) if available, else Limit.
-	if !p.getBurstMode() {
+
+	p.concurrencyLimitMu.RLock()
+	mode := p.concurrencyLimitMode
+	manualLimit := p.manualLimit
+	p.concurrencyLimitMu.RUnlock()
+
+	switch mode {
+	case "manual":
+		// If manualLimit is 0 (uninitialized), fall back to soft cap.
+		if manualLimit <= 0 {
+			if eff.Limit != nil {
+				return *eff.Limit
+			}
+			if eff.HardCap != nil {
+				return *eff.HardCap
+			}
+			return -1
+		}
+		// Clamp to [1, hardCap] if hardCap is available.
+		if eff.HardCap != nil && manualLimit > *eff.HardCap {
+			manualLimit = *eff.HardCap
+		}
+		if manualLimit < 1 {
+			manualLimit = 1
+		}
+		return manualLimit
+	case "hard":
+		if eff.HardCap != nil {
+			return *eff.HardCap
+		}
+		if eff.Limit != nil {
+			return *eff.Limit
+		}
+		return -1
+	default: // "soft" or empty
 		if eff.Limit != nil {
 			return *eff.Limit
 		}
@@ -3251,27 +3341,38 @@ func (p *Proxy) gateLimit() int {
 		}
 		return -1
 	}
-	if eff.HardCap != nil {
-		return *eff.HardCap
-	}
-	if eff.Limit != nil {
-		return *eff.Limit
-	}
-	return -1
 }
 
-// getBurstMode returns the current burst mode setting (thread-safe).
-func (p *Proxy) getBurstMode() bool {
-	p.burstModeMu.RLock()
-	defer p.burstModeMu.RUnlock()
-	return p.burstMode
+// getConcurrencyLimitMode returns the current concurrency limit mode (thread-safe).
+func (p *Proxy) getConcurrencyLimitMode() string {
+	p.concurrencyLimitMu.RLock()
+	defer p.concurrencyLimitMu.RUnlock()
+	return p.concurrencyLimitMode
 }
 
-// setBurstMode updates the burst mode setting (thread-safe).
-func (p *Proxy) setBurstMode(enabled bool) {
-	p.burstModeMu.Lock()
-	p.burstMode = enabled
-	p.burstModeMu.Unlock()
+// setConcurrencyLimitMode updates the concurrency limit mode (thread-safe).
+func (p *Proxy) setConcurrencyLimitMode(mode string) {
+	p.concurrencyLimitMu.Lock()
+	p.concurrencyLimitMode = mode
+	p.concurrencyLimitMu.Unlock()
+}
+
+// getManualLimit returns the current manual concurrency limit (thread-safe).
+func (p *Proxy) getManualLimit() int {
+	p.concurrencyLimitMu.RLock()
+	defer p.concurrencyLimitMu.RUnlock()
+	return p.manualLimit
+}
+
+// setManualLimit updates the manual concurrency limit (thread-safe).
+// Clamps to >= 1.
+func (p *Proxy) setManualLimit(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	p.concurrencyLimitMu.Lock()
+	p.manualLimit = limit
+	p.concurrencyLimitMu.Unlock()
 }
 
 // TryEnqueueOrDispatch attempts to dispatch a request immediately if under the
@@ -3344,8 +3445,21 @@ func (p *Proxy) getQueueLen() int {
 	return p.QueueLen
 }
 
+// getSlotFreeDelay returns the configured slot-free delay in seconds (thread-safe).
+// Reads Config.SlotFreeDelay under configMu.RLock.
+func (p *Proxy) getSlotFreeDelay() int {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
+	return p.Config.SlotFreeDelay
+}
+
 // OnRequestComplete decrements the active request count and processes the queue.
+// If SlotFreeDelay > 0, it sleeps that many seconds before freeing the slot.
 func (p *Proxy) OnRequestComplete() {
+	// Configurable delay before freeing the slot (avoids upstream rate limits).
+	if delay := p.getSlotFreeDelay(); delay > 0 {
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
 	p.queueMu.Lock()
 	if p.ActiveRequests > 0 {
 		p.ActiveRequests--
@@ -3982,6 +4096,7 @@ func (p *Proxy) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		"models_count":    modelsCount,
 		"runtime":         "go",
 		"runtime_version": runtime.Version(),
+		"version":         p.Version,
 		"port":            ParseListenPort(p.Config.ListenAddr),
 		"visionHandoff": map[string]interface{}{
 			"enabled":      p.Config.VisionHandoffEnabled,
@@ -4258,7 +4373,9 @@ func (p *Proxy) HandleConfigGet(w http.ResponseWriter, r *http.Request) {
 		"visionHandoffCacheEnabled": p.Config.VisionHandoffCacheEnabled,
 		"wallpaperSource":           p.Config.WallpaperSource,
 		"apikeyMode":                p.Config.ApiKeyMode,
-		"burstMode":                 p.getBurstMode(),
+		"concurrencyLimitMode":      p.getConcurrencyLimitMode(),
+		"manualConcurrencyLimit":     p.getManualLimit(),
+		"slotFreeDelay":              p.Config.SlotFreeDelay,
 	})
 }
 
@@ -4367,12 +4484,47 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 			p.Config.ApiKeyMode = v
 		}
 	}
-	if v, ok := data["burstMode"].(bool); ok {
-		p.Config.BurstMode = v
-		p.setBurstMode(v)
-		if v {
+	if mode, ok := data["concurrencyLimitMode"].(string); ok {
+		if mode == "soft" || mode == "hard" || mode == "manual" {
+			p.Config.ConcurrencyLimitMode = mode
+			p.setConcurrencyLimitMode(mode)
+			// Sync deprecated BurstMode for rollback safety.
+			p.Config.BurstMode = (mode == "hard")
+			// When switching to manual mode with manualLimit == 0,
+			// initialize it to the current soft cap (or hard cap if no soft cap).
+			if mode == "manual" && p.getManualLimit() == 0 {
+				eff := p.GetEffectiveConcurrency(p.LastConcurrency)
+				var defaultLimit int
+				if eff.Limit != nil {
+					defaultLimit = *eff.Limit
+				} else if eff.HardCap != nil {
+					defaultLimit = *eff.HardCap
+				} else {
+					defaultLimit = 1
+				}
+				p.Config.ManualConcurrencyLimit = defaultLimit
+				p.setManualLimit(defaultLimit)
+			}
+			// Any mode change can change the gate, so always process the queue
+			// to dispatch waiting items or clear stale state.
 			go p.ProcessQueue()
 		}
+	}
+	if v, ok := data["manualConcurrencyLimit"].(float64); ok {
+		limit := int(v)
+		if limit < 1 {
+			limit = 1
+		}
+		p.Config.ManualConcurrencyLimit = limit
+		p.setManualLimit(limit)
+		go p.ProcessQueue()
+	}
+	if v, ok := data["slotFreeDelay"].(float64); ok {
+		delay := int(v)
+		if delay < 0 {
+			delay = 0
+		}
+		p.Config.SlotFreeDelay = delay
 	}
 	if v, ok := data["keys"].([]interface{}); ok {
 		keys := make([]KeyConfig, 0, len(v))
@@ -4412,7 +4564,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		"visionHandoffCacheEnabled": p.Config.VisionHandoffCacheEnabled,
 		"wallpaperSource":           p.Config.WallpaperSource,
 		"apikeyMode":                p.Config.ApiKeyMode,
-		"burstMode":                 p.getBurstMode(),
+		"concurrencyLimitMode":   p.getConcurrencyLimitMode(),
+		"manualConcurrencyLimit": p.getManualLimit(),
+		"slotFreeDelay":            p.Config.SlotFreeDelay,
 		"restartRequired":           restartRequired,
 	})
 }
@@ -4621,6 +4775,8 @@ func (p *Proxy) HandleConcurrency(w http.ResponseWriter, r *http.Request) {
 	// serializes to JSON null).
 	resp["limit"] = eff.Limit
 	resp["hard_cap"] = eff.HardCap
+	resp["concurrency_limit_mode"] = p.getConcurrencyLimitMode()
+	resp["manual_limit"] = p.getManualLimit()
 	WriteJSON(w, http.StatusOK, resp)
 }
 

@@ -20,6 +20,8 @@ const (
 	maxPortRetries    = 3
 	portRetryDelay    = 2 * time.Second
 	maxPortIncrements = 10
+
+	Version = "1.1.0"
 )
 
 func main() {
@@ -31,6 +33,7 @@ func main() {
 
 	// Step 2: Create Proxy (runs §31 steps 2-7 inside NewProxy)
 	p := proxy.NewProxy(&cfg)
+	p.Version = Version
 
 	// Step 3: Parse listen address
 	listenAddr := cfg.ListenAddr
@@ -87,7 +90,7 @@ func main() {
 	}
 
 	// Step 6: Log successful listen
-	log.Printf("UMANS proxy listening on %s:%d", host, currentPort)
+	log.Printf("UMANS Dash Go v%s listening on %s:%d", Version, host, currentPort)
 
 	// Step 7: Start serving in goroutine
 	go func() {

@@ -322,6 +322,19 @@
     }
     /* ---- Section header icons ---- */
     .card-header .bi { font-size:0.85rem; opacity:0.7; }
+    /* ---- Manual concurrency slider ---- */
+    #manualLimitWrapper .form-range { height:0.5rem; padding:0; cursor:pointer; }
+    #manualLimitWrapper .form-range::-webkit-slider-thumb {
+      -webkit-appearance:none; width:14px; height:14px; border-radius:50%;
+      background:#6366f1; border:2px solid rgba(255,255,255,0.8);
+      box-shadow:0 0 8px rgba(99,102,241,0.4);
+    }
+    #manualLimitWrapper .form-range::-moz-range-thumb {
+      width:14px; height:14px; border-radius:50%;
+      background:#6366f1; border:2px solid rgba(255,255,255,0.8);
+      box-shadow:0 0 8px rgba(99,102,241,0.4);
+    }
+    #manualLimitWrapper .form-range:disabled { opacity:0.4; cursor:not-allowed; }
   </style>
 </head>
 <body>
@@ -523,12 +536,24 @@
               </div>
               <div class="mb-2">
                 <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">
-                  Burst Mode
-                  <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="When Off, concurrency is limited to the soft cap (Limit). When On, concurrency can reach the hard cap (Burst)."></i>
+                  Concurrency Limit
+                  <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="Soft Cap: gate at the soft cap (Limit). Hard Cap: gate at the hard cap (Burst). Manual: set a custom concurrency limit via slider."></i>
                 </label>
-                <div class="btn-group w-100" role="group" id="burstModeGroup" aria-label="Burst mode">
-                  <button class="btn btn-outline-action btn-burst" data-burst="off" onclick="toggleBurstMode(false)">Off</button>
-                  <button class="btn btn-outline-action btn-burst" data-burst="on" onclick="toggleBurstMode(true)">On</button>
+                <div class="btn-group w-100" role="group" id="concurrencyLimitGroup" aria-label="Concurrency limit mode">
+                  <button class="btn btn-outline-action btn-conclimit" data-conclimit="soft" onclick="setConcurrencyLimitMode('soft')">Soft Cap</button>
+                  <button class="btn btn-outline-action btn-conclimit" data-conclimit="hard" onclick="setConcurrencyLimitMode('hard')">Hard Cap</button>
+                  <button class="btn btn-outline-action btn-conclimit" data-conclimit="manual" onclick="setConcurrencyLimitMode('manual')">Manual</button>
+                </div>
+                <div id="manualLimitWrapper" style="display:none; margin-top:6px;">
+                  <div class="d-flex justify-content-between align-items-center" style="font-size:0.65rem;color:rgba(255,255,255,0.6);margin-bottom:2px;">
+                    <span>1</span>
+                    <span id="manualLimitValue" style="color:#c7d2fe;font-weight:600;">--</span>
+                    <span id="manualLimitMax">--</span>
+                  </div>
+                  <input type="range" class="form-range" id="manualLimitSlider" min="1" max="1" value="1"
+                         style="accent-color: #6366f1;"
+                         oninput="onManualLimitInput(this.value)"
+                         onchange="onManualLimitChange(this.value)">
                 </div>
               </div>
               <div class="mb-2">
@@ -562,6 +587,15 @@
                   <button class="btn btn-outline-action btn-handoffcache" data-handoffcache="on" onclick="toggleHandoffCache(true)">On</button>
                 </div>
                 <div id="handoffCacheStats" style="font-size:0.6rem;color:rgba(255,255,255,0.5);margin-top:2px"></div>
+              </div>
+              <div class="mb-2">
+                <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">
+                  Slot Free Delay
+                  <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="Delay (in seconds) before freeing a concurrency slot after a request completes. 0 = immediate. Useful to avoid upstream rate limits."></i>
+                </label>
+                <input type="number" class="form-control form-control-sm" id="slotFreeDelayInput" min="0" step="1" value="0"
+                       style="background:rgba(0,0,0,0.25);border:1px solid var(--bd-1);color:#fff;font-size:0.75rem"
+                       onchange="onSlotFreeDelayChange(this.value)">
               </div>
             </div>
           </div>
@@ -736,24 +770,63 @@
     function setWallpaperActive(source) {
       document.querySelectorAll('.btn-wp').forEach(b => { const isActive = b.dataset.wp === source; b.classList.toggle('active', isActive); b.setAttribute('aria-pressed', isActive ? 'true' : 'false'); });
     }
-    let _burstModeEnabled = false;
-    function setBurstModeActive(enabled) {
-      _burstModeEnabled = enabled;
-      document.querySelectorAll('.btn-burst').forEach(btn => {
-        const isActive = (enabled && btn.dataset.burst === 'on') || (!enabled && btn.dataset.burst === 'off');
+    let _concurrencyLimitMode = 'soft';
+    let _manualLimit = 1;
+    function setConcurrencyLimitActive(mode) {
+      _concurrencyLimitMode = mode;
+      document.querySelectorAll('.btn-conclimit').forEach(btn => {
+        const isActive = btn.dataset.conclimit === mode;
         btn.classList.toggle('active', isActive);
         btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
       });
+      const wrapper = document.getElementById('manualLimitWrapper');
+      if (wrapper) wrapper.style.display = mode === 'manual' ? '' : 'none';
+      if (mode === 'manual') {
+        const slider = document.getElementById('manualLimitSlider');
+        const valEl = document.getElementById('manualLimitValue');
+        if (slider && _manualLimit > 0) { slider.value = _manualLimit; }
+        if (valEl) { valEl.textContent = _manualLimit > 0 ? _manualLimit : '--'; }
+      }
     }
-    async function toggleBurstMode(enabled) {
-      const prev = _burstModeEnabled;
-      setBurstModeActive(enabled);
+    async function setConcurrencyLimitMode(mode) {
+      const prev = _concurrencyLimitMode;
+      setConcurrencyLimitActive(mode);
       try {
-        const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ burstMode: enabled }) });
+        const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ concurrencyLimitMode: mode }) });
         if (!r.ok) throw new Error('config save failed');
         fetchConcurrency();
       } catch {
-        setBurstModeActive(prev);
+        setConcurrencyLimitActive(prev);
+      }
+    }
+    function onManualLimitInput(value) {
+      document.getElementById('manualLimitValue').textContent = value;
+    }
+    async function onManualLimitChange(value) {
+      const limit = parseInt(value, 10);
+      const prev = _manualLimit;
+      _manualLimit = limit;
+      document.getElementById('manualLimitValue').textContent = limit;
+      try {
+        const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ manualConcurrencyLimit: limit }) });
+        if (!r.ok) throw new Error('config save failed');
+        fetchConcurrency();
+      } catch {
+        _manualLimit = prev;
+        const slider = document.getElementById('manualLimitSlider');
+        if (slider) slider.value = prev;
+        document.getElementById('manualLimitValue').textContent = prev;
+      }
+    }
+    async function onSlotFreeDelayChange(value) {
+      const delay = Math.max(0, parseInt(value, 10) || 0);
+      const input = document.getElementById('slotFreeDelayInput');
+      try {
+        const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slotFreeDelay: delay }) });
+        if (!r.ok) throw new Error('config save failed');
+        if (input) input.value = delay;
+      } catch {
+        // Revert handled by next loadConfig/fetchConcurrency
       }
     }
     function setApiKeyModeActive(mode) {
@@ -909,37 +982,55 @@
         document.getElementById('concQueued').textContent = queued.toString();
         document.getElementById('concLimit').textContent = limit.toString();
         document.getElementById('concBurst').textContent = hardCap != null ? hardCap.toString() : '--';
-        // When burst mode is Off, scale the bar to the soft cap (limit) only.
-        // When On (or no hardCap), scale to hardCap and show both zones.
-        const burstOn = _burstModeEnabled && hardCap != null;
-        const barMax = burstOn ? hardCap : limit;
+        // Determine the effective gate based on concurrency limit mode.
+        const mode = d.concurrency_limit_mode || _concurrencyLimitMode || 'soft';
+        const manualLimit = d.manual_limit != null ? d.manual_limit : _manualLimit;
+        let barMax;
+        if (mode === 'manual' && manualLimit > 0) {
+          barMax = manualLimit;
+        } else if (mode === 'hard' && hardCap != null) {
+          barMax = hardCap;
+        } else {
+          barMax = limit;
+        }
+        // Update manual slider max to current hardCap
+        const slider = document.getElementById('manualLimitSlider');
+        if (slider) {
+          if (hardCap != null && hardCap > 0) {
+            slider.max = hardCap;
+            slider.disabled = false;
+            const clamped = Math.min(Math.max(parseInt(slider.value, 10) || 1, 1), hardCap);
+            slider.value = clamped;
+            document.getElementById('manualLimitMax').textContent = hardCap;
+          } else {
+            slider.disabled = true;
+            document.getElementById('manualLimitMax').textContent = '--';
+          }
+        }
         // Solid fill = proxy's active count, dotted overlay = upstream's concurrent count
         const activePct = barMax > 0 ? Math.min(100, (active / barMax) * 100) : 0;
         const upstreamPct = barMax > 0 ? Math.min(100, (concurrent / barMax) * 100) : 0;
-        // Bottom borders: yellow for soft cap zone, orange for burst zone
-        const softPct = burstOn ? ((limit > 0 && hardCap > limit) ? (limit / hardCap) * 100 : 100) : 100;
+        // Bottom borders: show zones when barMax > limit
+        const showZones = (mode === 'hard' || (mode === 'manual' && manualLimit > limit)) && hardCap != null && limit > 0;
+        const softPct = showZones ? ((limit > 0 && barMax > limit) ? (limit / barMax) * 100 : 100) : 100;
         document.getElementById('concBottomSoft').style.width = softPct + '%';
         document.getElementById('concBottomBurst').style.left = softPct + '%';
         document.getElementById('concBottomBurst').style.width = (100 - softPct) + '%';
         // Solid fill (proxy active): green in soft cap region, orange in burst region
         const bar = document.getElementById('concurrencyProgressBar');
         bar.style.width = activePct + '%';
-        if (burstOn && active > limit && limit > 0) {
-          // In burst zone: green up to limit, orange for the burst portion.
-          // The gradient covers the filled bar (width = activePct), so the
-          // transition must be expressed as a percentage of *that* filled width.
+        if (showZones && active > limit && limit > 0) {
           const limitPct = activePct > 0 ? Math.min(100, (limit / active) * 100) : 100;
           bar.style.background = `linear-gradient(90deg, #34d399 0%, #34d399 ${limitPct}%, #fb923c ${limitPct}%, #fb923c 100%)`;
           bar.style.boxShadow = '0 0 8px rgba(251,146,60,0.4)';
         } else {
-          // Within soft cap: solid green
           bar.style.background = '#34d399';
           bar.style.boxShadow = '0 0 8px rgba(52,211,153,0.4)';
         }
         // Dotted overlay (upstream concurrent)
         document.getElementById('concurrencyUpstreamBar').style.width = upstreamPct + '%';
         document.getElementById('concUsageText').textContent = active + ' of ' + barMax + ' sessions';
-        const pctVsSoft = limit > 0 ? Math.min(200, (active / limit) * 100) : (barMax > 0 ? (active / barMax) * 100 : 0);
+        const pctVsSoft = barMax > 0 ? Math.min(200, (active / barMax) * 100) : 0;
         document.getElementById('concPctText').textContent = parseFloat(pctVsSoft.toFixed(2)) + '%';
         const pb = document.querySelector('[role="progressbar"]');
         if (pb) pb.setAttribute('aria-valuenow', Math.round(activePct).toString());
@@ -955,9 +1046,6 @@
               topUid.textContent = '•'.repeat(Math.min(d.user_id.length, 12));
             }
           }
-        }
-        if (queued > 0) {
-          details.push({ label: 'Queued', value: queued.toString(), warn: true, color: '#60a5fa' });
         }
         detailGrid.innerHTML = details.map(d =>
           `<div class="${d.color?`border-top-color:${d.color};`:''}"><div class="card stat-inline-card h-100"><div class="card-content" style="${d.color?`border-top-color:${d.color};`:''}"><div class="stats-value" style="color:${d.warn?'#fbbf24':'#fff'}${d.masked?'':';font-variant-numeric:tabular-nums'}">${d.masked?`<span class="masked-userid" data-userid="${escapeHtml(d.value)}" onclick="this.classList.toggle('revealed');this.textContent=this.classList.contains('revealed')?this.dataset.userid:'${'•'.repeat(Math.min(d.value.length, 12))}'" style="cursor:pointer">${'•'.repeat(Math.min(d.value.length, 12))}</span>`:escapeHtml(d.value)}</div><div class="stats-label">${escapeHtml(d.label)}</div></div></div></div>`
@@ -1045,10 +1133,21 @@
           setHandoffCacheActive(cd.visionHandoffCacheEnabled !== false);
           const cacheWrapper = document.getElementById('handoffCacheWrapper');
           if (cacheWrapper) cacheWrapper.style.display = cd.visionHandoffEnabled ? '' : 'none';
-          // Burst mode init (from backend config)
-          setBurstModeActive(cd.burstMode === true);
+          // Concurrency limit mode init (from backend config)
+          const concMode = cd.concurrencyLimitMode || 'soft';
+          setConcurrencyLimitActive(concMode);
+          if (cd.manualConcurrencyLimit != null && cd.manualConcurrencyLimit > 0) {
+            _manualLimit = cd.manualConcurrencyLimit;
+            const slider = document.getElementById('manualLimitSlider');
+            if (slider) slider.value = cd.manualConcurrencyLimit;
+            const valEl = document.getElementById('manualLimitValue');
+            if (valEl) valEl.textContent = cd.manualConcurrencyLimit;
+          }
           // API key mode init (smart/managed/passthrough)
           setApiKeyModeActive(cd.apikeyMode || 'smart');
+          // Slot free delay init
+          const sfdInput = document.getElementById('slotFreeDelayInput');
+          if (sfdInput) sfdInput.value = cd.slotFreeDelay != null ? cd.slotFreeDelay : 0;
         }
         // Mobile: collapse right-column sections by default
         if (window.matchMedia('(max-width: 575px)').matches) {

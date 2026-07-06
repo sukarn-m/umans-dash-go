@@ -47,13 +47,22 @@ Path: `.config/config.json` (relative to the binary's working directory).
   "VISION_HANDOFF_CACHE_ENABLED": false,
   "VISION_HANDOFF_CACHE_TTL": "24h",
   "API_KEY_MODE": "smart",
+  "CONCURRENCY_LIMIT_MODE": "soft",
+  "MANUAL_CONCURRENCY_LIMIT": 0,
+  "SLOT_FREE_DELAY": 0,
   "BURST_MODE": false
 }
 ```
 
 The `API_KEY_MODE` field controls how the proxy handles API keys (see §27). Valid values: `"smart"` (default), `"managed"`, `"passthrough"`.
 
-The `BURST_MODE` field (bool) controls the concurrency gate limit (§5.3). When `false`, the proxy gates at the soft cap (`limit`). When `true`, it gates at the hard cap (`hard_cap`), allowing requests to burst past the soft cap up to the hard ceiling. Defaults to `false`.
+The `CONCURRENCY_LIMIT_MODE` field (string) controls the concurrency gate (§5.3): `"soft"` (default) gates at the soft cap (`limit`), `"hard"` gates at the hard cap (`hard_cap`), `"manual"` gates at `MANUAL_CONCURRENCY_LIMIT` (clamped to `[1, hard_cap]`). When switching to `"manual"` with `MANUAL_CONCURRENCY_LIMIT == 0`, it is auto-initialized to the current soft cap.
+
+The `MANUAL_CONCURRENCY_LIMIT` field (int) is the user-chosen gate value when mode is `"manual"`. Default 0 (uninitialized). Clamped to `[1, hard_cap]` at read time in `gateLimit()`.
+
+The `SLOT_FREE_DELAY` field (int, seconds) introduces a delay before `OnRequestComplete()` decrements `ActiveRequests` and processes the queue. Default 0 (immediate). Useful to avoid upstream rate limits when requests complete in rapid succession.
+
+The `BURST_MODE` field (bool) is deprecated. Kept for config migration + rollback safety. Migrated to `CONCURRENCY_LIMIT_MODE` on startup in `NewProxy()`: `true` → `"hard"`, `false`/missing → `"soft"`. Synced in `HandleConfigPost`: set to `true` when mode is `"hard"`, `false` otherwise.
 
 ### 2.2 Defaults
 
@@ -66,7 +75,10 @@ The `BURST_MODE` field (bool) controls the concurrency gate limit (§5.3). When 
 | `MAX_IMAGES` | `9` | Max images per request |
 | `wallpaperSource` | `bing` | Wallpaper source: `none`, `bing`, or `wallhaven` |
 | `API_KEY_MODE` | `smart` | API key handling mode: `smart`, `managed`, or `passthrough` (§27) |
-| `BURST_MODE` | `false` | When true, `gateLimit()` uses hard cap instead of soft cap (§5.3) |
+| `CONCURRENCY_LIMIT_MODE` | `soft` | Concurrency gating mode: `soft`, `hard`, or `manual` (§5.3) |
+| `MANUAL_CONCURRENCY_LIMIT` | `0` | Custom gate when mode is `manual` (0 = auto-init to soft cap) |
+| `SLOT_FREE_DELAY` | `0` | Delay (seconds) before freeing a concurrency slot (0 = immediate) |
+| `BURST_MODE` | `false` | Deprecated. Migrated to `CONCURRENCY_LIMIT_MODE`. Kept for rollback safety. |
 | `VISION_HANDOFF_ENABLED` | `false` | Enable vision handoff |
 | `VISION_HANDOFF_MODEL` | `umans-coder` | Model to use for image analysis |
 | `VISION_HANDOFF_PROMPT` | `""` (uses built-in default) | System prompt for image analysis |
@@ -264,14 +276,19 @@ type QueueItem struct {
 
 ### 5.3 Concurrency Gating
 
-The gate limit depends on **burst mode** (`getBurstMode()`, backed by `Config.BurstMode`):
+The gate limit depends on the **concurrency limit mode** (`getConcurrencyLimitMode()`, backed by `Config.ConcurrencyLimitMode`):
 
-- **Burst mode Off** (default): gate at the soft cap (`limit`). If `limit` is null, no gating.
-- **Burst mode On**: gate at the hard cap (`hard_cap`). If `hard_cap` is null, falls back to `limit`.
+- **Soft Cap** (`"soft"`, default): gate at the soft cap (`limit`). If `limit` is null, fall back to `hard_cap`. If both null, no gating (-1).
+- **Hard Cap** (`"hard"`): gate at the hard cap (`hard_cap`). If `hard_cap` is null, fall back to `limit`. If both null, no gating (-1).
+- **Manual** (`"manual"`): gate at `manualLimit` (from `Config.ManualConcurrencyLimit`). If `manualLimit` is 0 (uninitialized), fall back to soft cap behavior. Clamp `manualLimit` to `[1, hard_cap]` if `hard_cap` is available. If `hard_cap` is nil, use `manualLimit` as-is (clamped to ≥ 1).
 
-If no gate applies (both null under the active mode), all requests execute immediately.
+`gateLimit()` acquires `concurrencyLimitMu.RLock()` once, snapshots both `concurrencyLimitMode` and `manualLimit`, releases the lock, then switches on mode. This avoids holding the lock during `GetEffectiveConcurrency()` (which takes its own locks internally).
 
-`getBurstMode()` and `setBurstMode(enabled)` are thread-safe accessors protected by `burstModeMu` (`sync.RWMutex`). `NewProxy()` calls `setBurstMode(cfg.BurstMode)` on startup to restore the persisted state. `HandleConfigPost` calls `setBurstMode()` after updating config, and triggers `ProcessQueue()` (asynchronously) when enabling burst mode — this immediately dispatches any queued requests that now fit under the raised gate.
+`getConcurrencyLimitMode()` and `setConcurrencyLimitMode(mode)` are thread-safe accessors protected by `concurrencyLimitMu` (`sync.RWMutex`). Similarly, `getManualLimit()` and `setManualLimit(limit)` (clamps to ≥ 1) use the same mutex.
+
+`NewProxy()` migrates the old `BurstMode` field: if `ConcurrencyLimitMode` is empty, `BurstMode == true` → `"hard"`, `false`/missing → `"soft"`. Calls `setConcurrencyLimitMode(mode)` and `setManualLimit(cfg.ManualConcurrencyLimit)` (if > 0) on startup.
+
+`HandleConfigPost` accepts `concurrencyLimitMode` (validated `"soft"`/`"hard"`/`"manual"`), `manualConcurrencyLimit` (int, clamped ≥ 1), and `slotFreeDelay` (int seconds, clamped ≥ 0). When switching to `"manual"` with `manualLimit == 0`, it auto-initializes to the current soft cap (or hard cap if no soft cap). It syncs `Config.BurstMode = (mode == "hard")` for rollback safety. It always calls `ProcessQueue()` on any mode change (not just `hard`/`manual`) since switching to `soft` from a more restrictive mode can also raise the gate.
 
 If `activeRequests >= gateLimit`:
 - If queue is full (`len(requestQueue) >= MAX_QUEUE_SIZE`): increment `throttledCount`, return 503 with `queue_full` error.
@@ -279,7 +296,7 @@ If `activeRequests >= gateLimit`:
 
 ### 5.4 `processQueue()`
 
-Called after each request completes (in `.finally` equivalent). Dequeues items while `activeRequests < gate` and dispatches:
+Called after each request completes (via `OnRequestComplete()`). If `Config.SlotFreeDelay > 0`, `OnRequestComplete()` sleeps that many seconds before decrementing `ActiveRequests` — this delays slot freeing to avoid upstream rate limits when requests complete in rapid succession. After decrementing, it calls `ProcessQueue()` which dequeues items while `activeRequests < gate` and dispatches:
 - `format == "anthropic"` → `proxyAnthropicRequest`
 - else → `proxyChatRequest`
 
@@ -702,6 +719,7 @@ Retries occur on:
 - **HTTP 500** — regardless of response body
 - **HTTP 503** — regardless of response body
 - **Network/fetch failures** (treated as 502) — errors thrown before a response is received
+- **Empty SSE stream** (OpenAI path only) — upstream returns HTTP 200 + `text/event-stream` but sends 0 data bytes before closing. The proxy peeks at the first chunk before committing SSE headers to the client; if empty, it treats this as a retryable 502, marks the key unhealthy, logs the error, and retries. If all retries fail, returns 502 with `"upstream returned empty stream"`. This prevents the "empty stream with no finish_reason" client error.
 
 ### 15.3 Key Rotation on Retry
 
@@ -888,7 +906,8 @@ Full request pipeline for `/v1/chat/completions`:
        - Mark key healthy (only if `!usingClientKey`).
        - If mode is `passthrough` or `smart` and `clientKey != ""`: call `setLastClientKey(clientKey)` to record last-known-good.
        - If SSE content type:
-          - Pipe SSE stream directly to client with backpressure handling.
+          - Peek at first chunk to detect empty streams. If 0 bytes + EOF, treat as retryable 502 (log, mark unhealthy, retry or return 502 if last attempt).
+          - If data exists, commit SSE headers, write peeked bytes, then pipe the rest of the body to the client.
         - If JSON:
           - Parse response body.
           - If streaming was requested (but got JSON): wrap as SSE chunk.
@@ -945,14 +964,15 @@ Reads the full body from an `*http.Request` or raw body string. Enforces `MAX_BO
 - Returns body as string.
 - **EOF handling**: All body-reading paths (`ReadBody`, `readBodyText`, `pipeBodyToResponse`) use `errors.Is(err, io.EOF)` to detect clean stream end rather than direct `==` comparison.
 
-### 21.2 `pipeBodyToResponse(body, res)`
+### 21.2 `pipeBodyToResponse(body, res)` → `(int, error)`
 
 Pipes upstream response body to HTTP response with:
-- **Client disconnect detection**: On `res.close`, destroy/cancel the upstream body.
-- **Backpressure**: When `res.write()` returns false, pause the upstream and resume on drain.
+- **Client disconnect detection**: Checks `r.Context().Done()` before each read; returns error if client disconnected.
+- **Flushing**: Flushes after each write via `http.Flusher`.
+- **Byte counting**: Returns total bytes written so caller can detect empty streams.
 - **EOF handling**: Uses `errors.Is(err, io.EOF)` for clean stream-end detection.
-- **Cleanup**: Remove all listeners on completion.
-- Returns a promise/goroutine that resolves when piping is complete.
+- **Cleanup**: Defers `body.Close()`.
+- Returns `(totalWritten, error)`.
 
 ---
 
@@ -1095,14 +1115,16 @@ Returns config with API key masked:
   "visionHandoffCacheEnabled": false,
   "wallpaperSource": "bing",
   "apikeyMode": "smart",
-  "burstMode": false
+  "concurrencyLimitMode": "soft",
+  "manualConcurrencyLimit": 0,
+  "slotFreeDelay": 0
 }
 ```
 
 ### 25.2 `POST /api/config`
 
 Accepts partial config updates. Updates any provided fields:
-- `apiKey`, `apiKeys`, `listenAddr`, `enabledModels`, `modelDisplayNames`, `wallpaperSource` (`none`, `bing`, or `wallhaven`), `overrideConcurrency`, `maxImages`, `disabledModels`, `visionHandoffEnabled`, `visionHandoffModel`, `visionHandoffPrompt`, `visionHandoffCacheEnabled`, `apikeyMode` (`smart`, `managed`, or `passthrough`), `burstMode` (bool — persists to `Config.BurstMode`, calls `setBurstMode()`, and triggers `ProcessQueue()` asynchronously when set to `true`), `keys` (rebuilds key pool).
+- `apiKey`, `apiKeys`, `listenAddr`, `enabledModels`, `modelDisplayNames`, `wallpaperSource` (`none`, `bing`, or `wallhaven`), `overrideConcurrency`, `maxImages`, `disabledModels`, `visionHandoffEnabled`, `visionHandoffModel`, `visionHandoffPrompt`, `visionHandoffCacheEnabled`, `apikeyMode` (`smart`, `managed`, or `passthrough`), `concurrencyLimitMode` (`soft`, `hard`, or `manual` — validates, syncs `BurstMode` for rollback, auto-inits `manualLimit` to soft cap when switching to manual with limit 0, always triggers `ProcessQueue()`), `manualConcurrencyLimit` (int, clamped ≥ 1, triggers `ProcessQueue()`), `slotFreeDelay` (int seconds, clamped ≥ 0), `keys` (rebuilds key pool).
 
 After update: `debouncedSaveConfig()` + `debouncedSetupOpencodeConfig()`.
 
@@ -1217,13 +1239,17 @@ Returns:
   "user_id": "...",
   "overridden": false,
   "active": 2,
-  "queued": 1
+  "queued": 1,
+  "concurrency_limit_mode": "soft",
+  "manual_limit": 0
 }
 ```
 
 - `?fresh=1` bypasses cache.
 - `active` is the proxy's `activeRequests` count.
 - `queued` is the `requestQueue` length.
+- `concurrency_limit_mode` is the current concurrency limit mode (`soft`, `hard`, or `manual`).
+- `manual_limit` is the current manual concurrency limit (used only when mode is `manual`).
 
 ---
 
@@ -1298,7 +1324,7 @@ Cache TTL: 1 hour.
 
 1. `loadConfig()` — Load `.config/config.json` + env var overrides.
 2. Initialize `ImageHandoffCache` (50 entries, 24h TTL or configured).
-3. Restore burst mode from config: `setBurstMode(cfg.BurstMode)`.
+3. Restore concurrency limit mode from config: `setConcurrencyLimitMode(mode)` (migrates old `BurstMode` → `ConcurrencyLimitMode`). Restore `manualLimit` if `ManualConcurrencyLimit > 0`.
 4. Initialize `KeyPool` from `config.keys` (or single default key).
 5. Initialize `UpstreamClient`.
 6. `validateApiKey()` — Verify via `/v1/models/info`, populate `modelInfoMap` + `modelDisplayNameMap`.
@@ -1328,13 +1354,14 @@ The dashboard is a standalone `dashboard.html` file, ported from the original Ja
 ### Ported features:
 - 5-hour Window card (Requests, Throttled, Cached %, Error %, Start Time, Tokens In/Out, plan badge)
 - Current Concurrency card (Active, Queued, Limit, Burst, dual-fill progress bar with soft-cap/burst zones, upstream overlay, percentage, detail grid)
-- **Burst Mode toggle** (backend-gated via `BURST_MODE` config field): When Off, `gateLimit()` returns the soft cap (`limit`), and the concurrency bar scales to the soft cap. When On, `gateLimit()` returns the hard cap (`hard_cap`), the bar scales to hard cap, and shows both soft-cap (green) and burst (orange) zones with a gradient fill. Frontend `toggleBurstMode(enabled)` POSTs `{burstMode: enabled}` to `/api/config`, reverts the UI state if the response is not `r.ok`, and calls `fetchConcurrency()` on success. The initial state is read from the backend config (`cd.burstMode`) during `loadConfig()`.
+- **Concurrency Limit selector** (backend-gated via `CONCURRENCY_LIMIT_MODE` config field): Three-button group (Soft Cap / Hard Cap / Manual) replacing the old Burst Mode On/Off toggle. Soft Cap gates at `limit`, Hard Cap gates at `hard_cap`, Manual reveals a slider (1 to `hard_cap`) for a custom limit. `setConcurrencyLimitMode(mode)` POSTs `{concurrencyLimitMode: mode}` to `/api/config`, reverts UI on failure, calls `fetchConcurrency()` on success. `onManualLimitChange(value)` POSTs `{manualConcurrencyLimit: value}` on slider release. `loadConfig()` reads `concurrencyLimitMode` and `manualConcurrencyLimit` from the backend. `fetchConcurrency()` reads `concurrency_limit_mode` and `manual_limit` from the concurrency API response to determine `barMax` for the progress bar and dynamically updates the slider max to the current hard cap. The redundant "Queued" card in the detail grid below the bar was removed (the count is already shown in the stat card above).
+- **Slot Free Delay input** — number input in Quick Settings (positive integer, default 0). POSTs `{slotFreeDelay: value}` to `/api/config` on change.
 - Usage History card (bar chart with Y-axis labels, dashed grid lines, X-axis labels, click-to-filter table, expandable per-model breakdown, sortable headers, metric toggle Tokens/Requests, status legend)
 - User ID in header bar (click-to-reveal masking)
 - API Key section (key pool display with status badges, collapsible)
 - **API Key Mode toggle** (Smart/Managed/Pass-Through button group in Quick Settings). In `passthrough` mode, the API Key (token pool) card is hidden.
 - Models section (enable/disable toggle per model via `DISABLED_MODELS`, collapsible)
-- Quick Settings (Automatic Refresh interval, Wallpaper selector (None/Bing/Wallhaven), Burst Mode toggle, API Key Mode selector, Vision Handoff toggle with info tooltip, Handoff Cache toggle (shown only when Vision Handoff is enabled) with cache stats line)
+- Quick Settings (Automatic Refresh interval, Wallpaper selector (None/Bing/Wallhaven), Concurrency Limit selector (Soft Cap/Hard Cap/Manual with slider), Slot Free Delay input, API Key Mode selector, Vision Handoff toggle with info tooltip, Handoff Cache toggle (shown only when Vision Handoff is enabled) with cache stats line)
 - Quick Actions (Check Health, Test Connection, Manual Refresh, Restart Proxy)
 - Environment (Runtime, Port, Started At)
 - Key Management Modal (add/edit/delete API keys with inline editing, account info with User ID)
