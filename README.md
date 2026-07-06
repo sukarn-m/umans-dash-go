@@ -31,10 +31,10 @@ This is a Go port and opinionated customization of the original Node.js project 
 
 ```
 umans-dash-go/
-├── cmd/umans-dash-go/
-│   └── main.go        # Entry point (config load, HTTP server, graceful shutdown)
-├── proxy.go           # Full proxy implementation (handlers, upstream client, queues, caching)
-├── types.go           # Type definitions (Config, KeyPool, Proxy, etc.)
+├── main.go            # Entry point (config load, HTTP server, graceful shutdown)
+├── proxy/
+│   ├── proxy.go       # Full proxy implementation (handlers, upstream client, queues, caching)
+│   └── types.go       # Type definitions (Config, KeyPool, Proxy, etc.)
 ├── dashboard.html     # Dashboard UI
 ├── go.mod             # Go module definition (stdlib only)
 ├── SPEC.md            # Technical specification
@@ -103,14 +103,14 @@ export UMANS_API_KEY=sk-...
 ### 3. Build and Run
 
 ```bash
-go build -o umans-dash-go ./cmd/umans-dash-go/
+go build -o umans-dash-go .
 ./umans-dash-go
 ```
 
 For development you can also run directly:
 
 ```bash
-go run ./cmd/umans-dash-go/
+go run .
 ```
 
 ### 4. Add Models
@@ -318,10 +318,10 @@ go build ./...
 go vet ./...
 
 # Run directly
-go run ./cmd/umans-dash-go/
+go run .
 
 # Build binary
-go build -o umans-dash-go ./cmd/umans-dash-go/
+go build -o umans-dash-go .
 ```
 
 ## License

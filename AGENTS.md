@@ -5,12 +5,12 @@
 ```
 UMANS-DASH-GO/
 ├── go.mod                # Module: umans-dash-go, go 1.22, zero external deps
+├── main.go               # Entry point (startup sequence, signal handling)
 ├── SPEC.md               # Technical spec for the Go rewrite
 ├── dashboard.html        # Dashboard UI (ported from JS proxy, minus excluded features)
-├── types.go              # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
-├── proxy.go              # Full proxy implementation
-├── cmd/umans-dash-go/
-│   └── main.go           # Entry point (startup sequence, signal handling)
+├── proxy/
+│   ├── types.go          # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
+│   └── proxy.go          # Full proxy implementation
 ├── .cache/               # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
 │   ├── wallpaper.jpg           # Cached Bing wallpaper (daily TTL)
 │   └── wallpaper-haven.jpg      # Cached Wallhaven wallpaper (hourly TTL)
@@ -24,10 +24,10 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 ## Current State
 
-- **`proxy.go` + `types.go`** contain the full implementation of all proxy functions.
+- **`proxy/proxy.go` + `proxy/types.go`** contain the full implementation of all proxy functions.
 - **`dashboard.html`** is the dashboard UI, ported from the JS proxy minus excluded features (see "Excluded from Original" below).
 
-## Key Types (types.go)
+## Key Types (proxy/types.go)
 
 | Type | Purpose |
 |---|---|
@@ -41,7 +41,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 | `ConcurrencyData` | Concurrency limits and current state |
 | `ImagePart` | An image found in a request payload (for vision handoff) |
 
-## Key Functions (proxy.go)
+## Key Functions (proxy/proxy.go)
 
 ### Config (§2)
 - `ParseDuration(str string) Duration` — Parse `"15m"`, `"6h"`, `"30s"`; bare numbers (pure digits) interpreted as **milliseconds**
@@ -158,7 +158,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 ```bash
 go build ./...                     # Compile check
 go vet ./...                       # Static analysis
-go run ./cmd/umans-dash-go/        # Start the proxy
+go run .                           # Start the proxy
 ```
 
 ## Concurrency & Mutex Model
