@@ -7,6 +7,7 @@ package proxy
 import (
 	"bufio"
 	"container/list"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -526,9 +527,10 @@ type Proxy struct {
 // the response is already in flight (e.g., SSE streaming).
 type responseWriterTracker struct {
 	http.ResponseWriter
-	mu       sync.Mutex
-	written  bool // true once WriteHeader or Write is called
-	hijacked bool // true after middleware takes over the response
+	mu         sync.Mutex
+	written    bool // true once WriteHeader or Write is called
+	hijacked   bool // true after middleware takes over the response
+	clientCtx  context.Context // original client context (not the timeout-wrapped one)
 }
 
 func (rw *responseWriterTracker) WriteHeader(code int) {

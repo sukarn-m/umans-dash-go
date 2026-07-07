@@ -2526,7 +2526,14 @@ func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Reque
 	}
 	defer body.Close()
 
+	// Use the original client context (not the timeout-wrapped one) so that
+	// long-running SSE streams aren't truncated when the request timeout fires.
+	// The timeout only governs the pre-streaming phase; once streaming begins,
+	// the stream runs until upstream EOF or client disconnect.
 	ctx := r.Context()
+	if tw, ok := w.(*responseWriterTracker); ok && tw.clientCtx != nil {
+		ctx = tw.clientCtx
+	}
 
 	totalWritten := 0
 	chunk := make([]byte, 4096)
@@ -5439,7 +5446,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	tw := &responseWriterTracker{ResponseWriter: w}
+	tw := &responseWriterTracker{ResponseWriter: w, clientCtx: r.Context()}
 
 	done := make(chan struct{})
 	go func() {
@@ -5488,6 +5495,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-done:
 	case <-ctx.Done():
+		// Timeout fired. If the response is already streaming (SSE), don't
+		// kill it — let the upstream stream continue. The timeout applies to
+		// the pre-streaming phase (queue + connect + first byte), not to the
+		// streaming duration. Only hijack if nothing has been written yet.
 		tw.mu.Lock()
 		alreadyWritten := tw.written
 		if !alreadyWritten {
@@ -5498,15 +5509,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !alreadyWritten {
 			WriteOpenAIError(tw, http.StatusGatewayTimeout,
 				"request timeout", "server_error", "timeout")
-		} else if tw.Header().Get("Content-Type") == "text/event-stream" {
-			errEv := SSEEvent{
-				Event: "error",
-				Data:  `{"error":"request timeout"}`,
-			}
-			tw.Write([]byte(errEv.Format()))
-			tw.Flush()
 		}
-
+		// If already streaming, do NOT inject a timeout error into the stream.
+		// Wait for the handler goroutine to finish naturally (upstream EOF or error).
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
