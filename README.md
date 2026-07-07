@@ -13,11 +13,11 @@ This is a Go port and opinionated customization of the original Node.js project 
 - **OpenAI-Compatible API** — Drop-in for `/v1/chat/completions` and `/v1/models`
 - **Anthropic Messages API** — Pass-through for `/v1/messages` (Anthropic-compatible clients)
 - **Multi-Key Pool** — Round-robin key pool with unhealthy marking, cooldowns, and persistence across restarts
-- **Automatic Upstream Retry** — Retries failed requests on HTTP 500/503 and network failures up to 10 times with escalating backoff, rotating to a fresh key on each attempt
+- **Automatic Upstream Retry** — Retries failed requests on HTTP 500/503 and network failures up to a configurable number of attempts (default 2, range 0–10) with configurable backoff presets (aggressive or conservative), rotating to a fresh key on each attempt. Applies to both OpenAI and Anthropic paths
 - **Concurrency Queue** — Bounded request queue gated by Concurrency Limit mode (Soft Cap, Hard Cap, or Manual with a custom slider), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full. A configurable Slot Free Delay (seconds) can pause before freeing a slot after request completion to avoid upstream rate limits
 - **Dashboard** — Clean UI with usage cards, concurrency monitoring, usage history chart with sortable tables, model management, key management, and configuration
 - **API Key Mode** — Smart (default), Managed, or Pass-Through mode controlling which API key is used for upstream requests (client key vs. proxy key pool)
-- **Empty Stream Detection** — Detects when upstream returns HTTP 200 + `text/event-stream` but sends zero data bytes, and treats it as a retryable error (up to 10 retries with escalating backoff) instead of forwarding an empty stream to the client
+- **Empty Stream Detection** — Detects when upstream returns HTTP 200 + `text/event-stream` but sends zero data bytes, and treats it as a retryable error (with configurable retry attempts) instead of forwarding an empty stream to the client
 - **Non-Blocking Config Updates** — Proxy request handlers snapshot config fields and release the config lock immediately, so settings changes complete instantly even during active LLM completions
 - **Bing Wallpaper** — Daily rotating UHD (3840px) backgrounds from Bing
 - **Wallhaven Wallpaper** — Optional high-resolution (≥2560×1440) backgrounds from Wallhaven with JPEG, PNG, and WebP support
@@ -37,7 +37,6 @@ umans-dash-go/
 │   └── types.go       # Type definitions (Config, KeyPool, Proxy, etc.)
 ├── dashboard.html     # Dashboard UI
 ├── go.mod             # Go module definition (stdlib only)
-├── SPEC.md            # Technical specification
 └── AGENTS.md          # Developer guide
 ```
 
@@ -46,31 +45,43 @@ umans-dash-go/
 - **Single Go binary** — no Node.js runtime, no `npm install`, no `node_modules`
 - **Zero external dependencies** — uses only the Go standard library
 - **Excluded features** (present in the upstream original, removed in this port):
-  - FreeGen AI wallpaper generator (and `/api/bg-freegen` endpoint)
-  - Sleev context-compression gateway
-  - Shell Guard (git-command blocking in tool-call responses)
-  - i18n autotranslation system (`/api/i18n`, `LOCALE` config)
-  - Response cache for non-streaming chat (`/api/cache`, `CACHE_TTL`/`CACHE_MAX_SIZE`/`CACHE_ENABLED`)
-  - UMANS app login (`EMAIL`/`PASSWORD`/`APP_SESSION`, `/api/umans/login`, `/api/umans/logout`)
-  - Per-model rate limit map (`RATE_LIMIT_MAP`)
+  - FreeGen AI wallpaper generator (`/api/bg-freegen`, `FREEGEN_PROMPT`, WebSocket integration with freegen.app)
+  - Sleev context-compression gateway (`SLEEV_ENABLED`, `SLEEV_GATEWAY_*`, binary discovery, OAuth sign-in, lifecycle management)
+  - `/api/sleev` endpoint (dashboard control to enable/disable and check Sleev gateway status)
+  - Shell Guard (git-command blocking in tool-call responses, streaming and non-streaming)
+  - i18n autotranslation system (`/api/i18n`, `I18N_STRINGS` catalog, `LOCALE` config, one-click autotranslate via `umans-flash`)
+  - Response cache for non-streaming chat (`ResponseCache`, `cacheKey()`, `/api/cache` GET/DELETE, `CACHE_TTL`/`CACHE_MAX_SIZE`/`CACHE_ENABLED`)
+  - UMANS app login (`EMAIL`/`PASSWORD`/`APP_SESSION`, `loginToApp()`, `/api/umans/login`, `/api/umans/logout`)
+  - Per-model rate limit map (`RATE_LIMIT_MAP`, `enforceRateLimit()`)
+  - Opencode config auto-setup (`setupOpencodeConfig()`, `discoverOpencodeConfigs()`: discovers and writes a `umans` provider entry into `opencode.json` with reasoning variants, context limits, tool/vision flags, and AGENTS.md/skills.md instructions; backs up existing config on first run)
+  - models.dev catalog integration (`getModelsDevCatalog()`, `findModelsDevEntry()`: fetches models.dev to derive reasoning mode and metadata for the opencode provider entry)
+  - Automatic dashboard browser launch on first run (`xdg-open`/`open`/`start` when opencode config is first created)
   - Test Chat panel in the dashboard
   - SS Mode (screenshot-safe blur/masking)
-  - SVG-filter glassmorphism (replaced with CSS `backdrop-filter`)
-  - SQLite usage-history cache (`.cache/usage.db`)
+  - SVG-filter glassmorphism (`feDisplacementMap`/`feColorMatrix`; replaced with CSS `backdrop-filter`)
+  - SQLite usage-history cache (`.cache/usage.db`, `node:sqlite`/`bun:sqlite`)
+- **Default value differences** (both ports have the feature, but defaults differ):
+  - Vision handoff default model: `umans-kimi-k2.7` upstream, `umans-coder` here
+  - Vision handoff default state: enabled (`true`) upstream, disabled (`false`) here
+  - Wallpaper source default: `freegen` upstream, `bing` here
 - **Added features** (not in the upstream original):
   - API Key Mode (Smart / Managed / Pass-Through) controlling which key is sent upstream
   - Concurrency Limit mode (Soft Cap / Hard Cap / Manual with slider), persisted to config
   - Slot Free Delay (configurable delay before freeing a concurrency slot)
-  - Empty SSE stream detection and retry (prevents "empty stream" client errors)
+  - Configurable Retry Attempts (slider, 0-10, default 2) with Backoff Strategy presets (aggressive/conservative) replacing hardcoded 10-retry count and flat 3s backoff
+  - Configurable Request Timeout (slider, 30s-30m, default 15m, applied live without restart)
+  - Anthropic path retry support (upstream `/v1/messages` is single-attempt only; this port retries on HTTP 500/503 and network failures with key rotation, matching the OpenAI path)
+  - Priority status card replacing Throttled card in the dashboard (always visible, red when Low priority)
+  - Empty SSE stream detection and retry (detects HTTP 200 + `text/event-stream` with zero data bytes; prevents "empty stream" client errors)
   - Non-blocking config updates (request handlers snapshot config fields and release the lock immediately)
   - Vision Handoff Image Cache (SHA-256 keyed LRU, 24h TTL, configurable)
-  - Thinking payload normalization (`budgetTokens` → `budget_tokens` for UMANS Pydantic compatibility)
-  - `DISABLED_MODELS` config field to hide specific models from the catalog
   - `/v1/models/info` endpoint exposing the raw upstream model catalog
   - UHD Bing wallpaper (3840px peapix resolution upgrade)
   - Wallhaven resolution filter (`atleast=2560x1440`) with JPEG/PNG/WebP content-type detection
   - Redesigned dashboard UI (unified refresh cycle, concurrency card with burst-zone visualization, sortable usage history with per-model drill-down)
-- **Wallpaper sources:** `none`, `bing`, or `wallhaven` only
+- **Shared features** (present in both, no behavioral difference documented):
+  - `DISABLED_MODELS` config field, tool schema normalization, thinking payload normalization, reasoning-level adaptive thinking injection
+- **Wallpaper sources:** `none`, `bing`, or `wallhaven` only (no `freegen`)
 - **Default listen address:** `127.0.0.1:8084`
 
 ## Quick Start

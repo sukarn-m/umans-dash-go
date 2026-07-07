@@ -21,7 +21,7 @@ const (
 	portRetryDelay    = 2 * time.Second
 	maxPortIncrements = 10
 
-	Version = "1.1.0"
+	Version = "1.2.0"
 )
 
 func main() {
@@ -34,6 +34,8 @@ func main() {
 	// Step 2: Create Proxy (runs §31 steps 2-7 inside NewProxy)
 	p := proxy.NewProxy(&cfg)
 	p.Version = Version
+	p.DashboardHTML = dashboardHTML
+	p.DashboardJS = dashboardJS
 
 	// Step 3: Parse listen address
 	listenAddr := cfg.ListenAddr
@@ -99,14 +101,7 @@ func main() {
 		}
 	}()
 
-	// Step 8: Setup opencode config (deferred 100ms)
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		homeDir, _ := os.UserHomeDir()
-		p.SetupOpencodeConfig(homeDir, currentPort)
-	}()
-
-	// Step 9: Signal handling (§31 step 10, §35.2)
+	// Step 8: Signal handling (§31 step 10, §35.2)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh

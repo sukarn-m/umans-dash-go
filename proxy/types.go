@@ -67,6 +67,19 @@ type Config struct {
 	// after a request completes. 0 = immediate (default). Useful to avoid
 	// hitting upstream rate limits when requests complete in rapid succession.
 	SlotFreeDelay int `json:"SLOT_FREE_DELAY"`
+
+	// RetryAttempts is the maximum number of retry attempts for upstream
+	// failures (500/502/503 and network errors). 0 = no retries (single attempt).
+	// Range: 0–10. Default: 2. Was hardcoded MaxRetries=10 before.
+	// Uses *int pointer to distinguish "field absent from old config" (nil → default 2)
+	// from "user explicitly set 0 retries" (0 → no retries).
+	RetryAttempts *int `json:"RETRY_ATTEMPTS,omitempty"`
+
+	// BackoffStrategy selects the per-attempt delay preset.
+	// "aggressive"   → 1s, 3s, 5s, 10s, 15s, 20s, 25s, 30s, 45s, 60s
+	// "conservative" → 5s, 15s, 30s, 45s, 60s, 120s, 180s, 240s, 300s
+	// Default: "aggressive".
+	BackoffStrategy string `json:"BACKOFF_STRATEGY"`
 }
 
 // Duration is a wrapper around time.Duration that can be JSON-serialized.
@@ -423,6 +436,11 @@ type Proxy struct {
 	ImageHandoffCache *ImageHandoffCache
 	StartedAt       time.Time
 	Version         string
+	DashboardHTML   []byte // embedded dashboard.html (template source)
+	DashboardJS     []byte // embedded dashboard.js (template source)
+	dashMu          sync.Mutex
+	dashRendered    []byte // cached rendered HTML
+	dashJsRendered  []byte // cached rendered JS
 	ModelInfoMap    map[string]ModelInfo
 	DisplayNameMap  map[string]string
 	DisabledModels  []string
@@ -461,11 +479,6 @@ type Proxy struct {
 	UpstreamModelsCache *upstreamModelsCacheEntry
 	UserInfoCache       *userInfoCacheEntry
 
-	// Dashboard HTML cache (§18.1)
-	dashMu    sync.Mutex
-	dashHtml  []byte
-	dashMtime time.Time
-
 	// Conversation tracking (§14)
 	convMu               sync.Mutex
 	conversationMap      map[string]*ConversationSession
@@ -498,6 +511,13 @@ type Proxy struct {
 	concurrencyLimitMu   sync.RWMutex
 	concurrencyLimitMode string
 	manualLimit          int
+
+	// Retry config snapshot, protected by retryConfigMu.
+	// Snapshot from Config at NewProxy + on each HandleConfigPost, so retryLoop
+	// can read it without acquiring configMu (which the retry callback also takes).
+	retryConfigMu   sync.RWMutex
+	retryAttempts   int
+	backoffStrategy string
 }
 
 // responseWriterTracker wraps an http.ResponseWriter to track whether
@@ -532,16 +552,16 @@ func (rw *responseWriterTracker) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
-// Flush delegates to the underlying writer if it implements http.Flusher.
+// Flush is hijack-aware so that SSE error events aren't written after the
+// timeout middleware has taken over the response.
 func (rw *responseWriterTracker) Flush() {
 	rw.mu.Lock()
-	if rw.hijacked {
-		rw.mu.Unlock()
+	hijacked := rw.hijacked
+	rw.mu.Unlock()
+	if hijacked {
 		return
 	}
-	flusher, ok := rw.ResponseWriter.(http.Flusher)
-	rw.mu.Unlock()
-	if ok {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
 }

@@ -4,18 +4,19 @@
 
 ```
 UMANS-DASH-GO/
-├── go.mod                # Module: umans-dash-go, go 1.22, zero external deps
-├── main.go               # Entry point (startup sequence, signal handling)
-├── SPEC.md               # Technical spec for the Go rewrite
-├── dashboard.html        # Dashboard UI (ported from JS proxy, minus excluded features)
+├── go.mod # Module: umans-dash-go, go 1.22, zero external deps
+├── main.go # Entry point (startup sequence, signal handling)
+├── dashboard.html # Dashboard UI (ported from JS proxy, minus excluded features)
+├── dashboard.js # Dashboard JavaScript (extracted, template-rendered)
+├── embed.go # go:embed wrapper for dashboard assets
 ├── proxy/
-│   ├── types.go          # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
-│   └── proxy.go          # Full proxy implementation
-├── .cache/               # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
-│   ├── wallpaper.jpg           # Cached Bing wallpaper (daily TTL)
-│   └── wallpaper-haven.jpg      # Cached Wallhaven wallpaper (hourly TTL)
-├── .logs/                # HTTP error logs (auto-created, per-session rotating files)
-└── AGENTS.md             # This file
+│ ├── types.go # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
+│ └── proxy.go # Full proxy implementation
+├── .cache/ # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
+│ ├── wallpaper.jpg # Cached Bing wallpaper (daily TTL)
+│ └── wallpaper-haven.jpg # Cached Wallhaven wallpaper (hourly TTL)
+├── .logs/ # HTTP error logs (auto-created, per-session rotating files)
+└── AGENTS.md # This file
 ```
 
 ## What This Project Is
@@ -31,11 +32,11 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 | Type | Purpose |
 |---|---|
-| `Config` | Runtime configuration (API keys, cache settings, concurrency override, **`ApiKeyMode`** / JSON `API_KEY_MODE`: `"smart"` (default), `"managed"`, or `"passthrough"`, **`ConcurrencyLimitMode`** / JSON `CONCURRENCY_LIMIT_MODE`: `"soft"` (default), `"hard"`, or `"manual"` — controls which cap gates concurrency, **`ManualConcurrencyLimit`** / JSON `MANUAL_CONCURRENCY_LIMIT`: `int` — user-chosen gate when mode is `"manual"`, **`SlotFreeDelay`** / JSON `SLOT_FREE_DELAY`: `int` seconds — delay before freeing a concurrency slot after request completion (0 = immediate, default), deprecated `BurstMode` / JSON `BURST_MODE` kept for migration + rollback safety, etc.) |
+| `Config` | Runtime configuration (API keys, cache settings, concurrency override, **`ApiKeyMode`** / JSON `API_KEY_MODE`: `"smart"` (default), `"managed"`, or `"passthrough"`, **`ConcurrencyLimitMode`** / JSON `CONCURRENCY_LIMIT_MODE`: `"soft"` (default), `"hard"`, or `"manual"` — controls which cap gates concurrency, **`ManualConcurrencyLimit`** / JSON `MANUAL_CONCURRENCY_LIMIT`: `int` — user-chosen gate when mode is `"manual"`, **`SlotFreeDelay`** / JSON `SLOT_FREE_DELAY`: `int` seconds — delay before freeing a concurrency slot after request completion (0 = immediate, default), **`RetryAttempts`** / JSON `RETRY_ATTEMPTS`: `*int` (omitempty) — max retry attempts (0–10, default 2, nil = unset → default), **`BackoffStrategy`** / JSON `BACKOFF_STRATEGY`: `string` — preset name (`"aggressive"` (default) or `"conservative"`), deprecated `BurstMode` / JSON `BURST_MODE` kept for migration + rollback safety, etc.) |
 | `KeyConfig` | A single API key entry (name, key, session) |
 | `KeyPool` | Round-robin multi-key pool with cooldown/unhealthy marking |
 | `ImageHandoffCache` | LRU cache for vision handoff image descriptions (SHA-256 keyed, 50 entries, 24h TTL) |
-| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state |
+| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state; `retryConfigMu` (`RWMutex`) / `retryAttempts` / `backoffStrategy` for thread-safe retry config state |
 | `ModelInfo` / `Capabilities` | Model metadata from upstream catalog |
 | `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types |
 | `ConcurrencyData` | Concurrency limits and current state |
@@ -43,70 +44,70 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 ## Key Functions (proxy/proxy.go)
 
-### Config (§2)
+### Config
 - `ParseDuration(str string) Duration` — Parse `"15m"`, `"6h"`, `"30s"`; bare numbers (pure digits) interpreted as **milliseconds**
 - `MaskToken(key string) string` — first 10 + `"..."` + last 4
 - `ParseListenPort(addr string) int` — Extract port from `"host:port"`
 - `LoadConfig() (Config, error)` — validates `RequestTimeout > 0` (fatal if not)
 - `saveConfig(cfg Config) error` — **atomic write** via `config.json.tmp` + `os.Rename`
 
-### KeyPool (§3)
+### KeyPool
 - `NewKeyPool(keys []KeyConfig) *KeyPool` — each entry defaults `CooldownMs = 30000`, `Healthy = true`
 - `(*KeyPool) Acquire(preferredIndex int) (*KeySlot, bool)`
 - `(*KeyPool) MarkUnhealthy(index, status int)` — cooldown: 503→60s, 502→30s, else 10s
 - `(*KeyPool) MarkHealthy(index int)`
 - `(*KeyPool) HealthyCount() int` / `Total() int` / `State() []KeyState`
 
-### ImageHandoffCache (§11)
+### ImageHandoffCache
 - `NewImageHandoffCache(maxSize int, ttl time.Duration) *ImageHandoffCache`
 - `(*ImageHandoffCache) Get(key string) (string, bool)` — updates LRU on hit
 - `(*ImageHandoffCache) Set(key, desc string)` — evicts oldest at capacity
 - `(*ImageHandoffCache) Stats() HandoffCacheStats` / `Resize(maxSize, ttl)`
 - `sha256Hash(s string) string` — SHA-256 hex digest for cache keys
 
-### Model Catalog (§8)
+### Model Catalog
 - `(*Proxy) ApplyCatalogData(data map[string]interface{})` — writes under `catalogMu.Lock()`
 - `(*Proxy) GetModelInfo(id string) ModelInfo` — reads under `catalogMu.RLock()`
 - `(*Proxy) GetModelDisplayName(id string) string` — reads under `catalogMu.RLock()`
 - `(*Proxy) GetOrderedModelIds() []string` — sorted by display name; reads under `catalogMu.RLock()`
 - `(*Proxy) GetEffectiveModels() []string` — filters disabled models; reads under `catalogMu.RLock()`
 
-### Vision Handoff (§11)
+### Vision Handoff
 - `(*Proxy) NeedsVisionHandoff(resolvedModel string) bool`
 - `(*Proxy) ResolveModelId(requestedModel string) string`
 - `CollectImageParts(payload map[string]interface{}) []ImagePart`
 - `(*Proxy) PerformVisionHandoff(payload, resolvedModel) int`
 
-### Tool Schema Normalization (§12)
+### Tool Schema Normalization
 - `NormalizeToolSchemas(tools []interface{})`
 - `TryResolveRef(node, defs) map[string]interface{}`
 - `SimplifyNullableCombinator(schema, key string)`
 - `NormalizeTypeField(schema)` / `NormalizeEnumField(schema)`
 
-### Payload Normalization (§13)
+### Payload Normalization
 - `StripReasoningContent(payload)` — removes `reasoning_content` from assistant messages
 - `NormalizeThinkingPayload(payload)` — camelCase `budgetTokens` → snake_case `budget_tokens`
 - `LimitImagesInMessages(payload, maxImages int)` — replaces excess images with placeholder text
 - `FingerprintPayload(payload) string` — MD5 hash of first user message, 12 chars
 - `MsgText(m) string` / `ExtractUserPrompt(payload) string`
 
-### Reasoning Helpers (§9)
+### Reasoning Helpers
 - `ParseLevels(raw interface{}) []string`
 - `InferReasoningModeFromCapabilities(reasoningCaps) *bool`
 - `BuildReasoningVariants(reasoningCaps) map[string]interface{}`
 
-### Error Logging (§16)
+### Error Logging
 - `RedactHeaders(headers map[string][]string) map[string][]string`
 - `RedactBodyJson(body string) string`
 
-### API Key Mode & Client Key Tracking (§17)
+### API Key Mode & Client Key Tracking
 - `applyDefaultApiKeyMode(cfg *Config)` — defaults `ApiKeyMode` to `"smart"` when unset (called in `LoadConfig` paths)
 - `extractClientAPIKey(req *http.Request) string` — reads `X-Api-Key` header, else `Authorization: Bearer` token
 - `(*Proxy) setLastClientKey(key string)` — thread-safe write under `lastClientKeyMu.Lock`
 - `(*Proxy) getLastClientKey() string` — thread-safe read under `lastClientKeyMu.RLock`
 - `(*Proxy) upstreamAPIKeyForDashboard() string` — selects the key for usage/history/concurrency calls per mode: passthrough→last client key; smart→last client key with pool fallback; managed→pool key
 
-### Concurrency Limit Mode & Slot Free Delay (§5)
+### Concurrency Limit Mode & Slot Free Delay
 - `(*Proxy) getConcurrencyLimitMode() string` — thread-safe read under `concurrencyLimitMu.RLock`
 - `(*Proxy) setConcurrencyLimitMode(mode string)` — thread-safe write under `concurrencyLimitMu.Lock`
 - `(*Proxy) getManualLimit() int` — thread-safe read under `concurrencyLimitMu.RLock`
@@ -117,7 +118,34 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `Config.SlotFreeDelay` (JSON `SLOT_FREE_DELAY`) — delay in seconds before `OnRequestComplete()` decrements `ActiveRequests`. Default 0 (immediate).
 - `HandleConfigPost` calls `ProcessQueue()` on any mode change (not just `hard`/`manual`) since switching to `soft` from a more restrictive mode can also raise the gate. When switching to `manual` with `manualLimit == 0`, initializes it to the current soft cap (or hard cap if no soft cap).
 
-### HTTP Helpers (§17)
+### Retry Config & Backoff
+- `(*Proxy) getRetryAttempts() int` — thread-safe read under `retryConfigMu.RLock`; uses `< 0` guard (not `<= 0`) so explicit 0 (no retries) passes through. Clamps to `MaxRetryAttemptsCap` (10). Returns `DefaultRetryAttempts` (2) when negative.
+- `(*Proxy) getBackoffStrategy() string` — thread-safe read under `retryConfigMu.RLock`; returns `"aggressive"` if empty.
+- `(*Proxy) setRetryConfig(attempts int, strategy string)` — thread-safe write under `retryConfigMu.Lock`. Called from `NewProxy()` and `HandleConfigPost`.
+- `(*Proxy) getRetryDelay(attempt int) time.Duration` — looks up `BackoffPresets[strategy][attempt-1]`, clamping to last entry if index exceeds preset length.
+- `(*Proxy) retryLoop(fn)` — method (was free function `RetryLoop`). Loops up to `getRetryAttempts()` times. When 0, runs callback once with `isLast=true`.
+- `BackoffPresets` — package-level `var` (map[string][]int): `"aggressive"` → {1,3,5,10,15,20,25,30,45,60}, `"conservative"` → {5,15,30,45,60,120,180,240,300}.
+- `Config.RetryAttempts` (JSON `RETRY_ATTEMPTS`, `*int` omitempty) — nil = unset → default 2; 0 = no retries; range 0–10. `Config.BackoffStrategy` (JSON `BACKOFF_STRATEGY`, string) — `"aggressive"` (default) or `"conservative"`.
+- Both persisted via `saveConfig()`; restored in `NewProxy()`. Old config.json files without these fields migrate gracefully (nil → default 2, empty → "aggressive").
+- `HandleConfigPost` accepts `retryAttempts` (float64, clamped [0,10]), `backoffStrategy` (string, validated against `BackoffPresets`), `requestTimeout` (float64 seconds, clamped [30,1800]).
+- `HandleConfigGet` exposes `retryAttempts`, `backoffStrategy`, `requestTimeout` (seconds).
+- Retry applies to both OpenAI (`proxyChatRequest`) and Anthropic (`proxyAnthropicRequest`) paths.
+- `(*UpstreamClient) SetTimeout(timeout time.Duration)` — live-updates `httpClient.Timeout` and transport's `ResponseHeaderTimeout` without restart.
+- `NewUpstreamClient` uses the configured timeout for `ResponseHeaderTimeout` (was hardcoded 300s).
+
+### Panic Safety & SSE Streaming
+- **`headersCommitted` flag** — both OpenAI and Anthropic retry loops track whether response headers have been written to the client. Once committed, the retry callback returns an error instead of attempting to write again. Prevents "superfluous response.WriteHeader" panics when a mid-stream pipe break triggers a retry.
+- **`safeFlush(w)`** — central helper that wraps `flusher.Flush()` with `defer func() { recover() }()`. All flush calls in the codebase go through this helper (or through `responseWriterTracker.Flush` which has its own hijack guard). No bare `flusher.Flush()` calls remain.
+- **`writeSSEErrorEvent`** — panic-safe: wrapped in `defer func() { recover() }()` so writing an error event to a dead/hijacked connection is silently swallowed.
+- **`writeSSEHeaders`** — idempotent: if `Content-Type: text/event-stream` is already set, returns without calling `WriteHeader` again.
+- **Retry callback panic recovery** — both OpenAI and Anthropic retry callbacks use named return values (`retry bool, err error`) with a `defer` recovery that logs the panic with `attempt`, `isLast`, and `headersCommitted` state, then returns the error to the retry loop.
+- **`responseWriterTracker`** — wraps the real `ResponseWriter` with `hijacked`/`written` tracking. `WriteHeader` returns early if hijacked. `Write` returns an error if hijacked. `Flush` returns early if hijacked. Used by the timeout middleware (`ServeHTTP`) to safely take over the response when a request times out mid-stream.
+
+### API Key Thread Safety
+- **No shared mutable `apiKey` field on `UpstreamClient`** — the API key is passed as an explicit parameter to `ChatCompletions`, `Messages`, `doPost`, `GetUsage`, and `GetUserInfo`. This eliminates the data race that occurred when multiple goroutines called `SetAPIKey` concurrently on the shared `p.Upstream` instance.
+- `SetAPIKey(key string)` still exists for backward compatibility but is not used in the request hot path.
+
+### HTTP Helpers
 - `(*Proxy) Authorized(req *http.Request) bool` — behavior now depends on `ApiKeyMode`: `passthrough` requires a client key present; `smart` always accepts (client or own key used downstream); `managed` validates the client's key against configured `APIKeys` (or accepts if `APIKeys` is empty)
 - `ReadBody(req *http.Request) (string, error)` — 5 MB cap; uses `errors.Is(err, io.EOF)` for clean stream end
 - `pipeBodyToResponse(body, w, r) (int, error)` — copies upstream response body to client with flushing; returns bytes written so caller can detect empty streams
@@ -127,7 +155,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `WriteAnthropicError(w, status, message, errType)`
 - `WritePassthroughError(w, status, body)` / `WriteAnthropicPassthroughError(w, status, body)`
 
-### Wallpaper Helpers (§30)
+### Wallpaper Helpers
 - `upgradePeapixResolution(imageURL string) string` — regex `_NNNN.(jpg|jpeg|png)$` → `_3840` for UHD peapix images
 - `downloadImage(imageURL, userAgent string, timeout time.Duration) []byte` — HTTP fetch with UA + timeout
 - `isValidImage(data []byte) bool` — validates JPEG/PNG/WebP magic bytes
@@ -137,9 +165,9 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `serveWallpaperImageTyped(w, data, expires, contentType)` — typed wallpaper serving with caller-specified Content-Type
 - `saveCacheFile(cacheFile string, data []byte) bool` — writes cache file, mkdir if needed
 
-### HTTP Handlers (§17–§29)
+### HTTP Handlers
 - `(*Proxy) HandleHealthz(w, r)` / `HandleModels(w, r)` / `HandleConfigGet(w, r)` — `HandleConfigGet` exposes `apikeyMode`, `concurrencyLimitMode`, `manualConcurrencyLimit`, and `slotFreeDelay` fields
-- `(*Proxy) HandleConfigPost(w, r)` — accepts `apikeyMode` (`managed`/`passthrough`/`smart`), `concurrencyLimitMode` (`soft`/`hard`/`manual`), `manualConcurrencyLimit` (int, clamped ≥ 1), `slotFreeDelay` (int seconds, clamped ≥ 0); syncs `BurstMode` for rollback safety; auto-initializes `manualLimit` to soft cap when switching to manual with limit 0; triggers `ProcessQueue()` on any mode change; triggers debounced save + opencode setup
+- `(*Proxy) HandleConfigPost(w, r)` — accepts `apikeyMode` (`managed`/`passthrough`/`smart`), `concurrencyLimitMode` (`soft`/`hard`/`manual`), `manualConcurrencyLimit` (int, clamped ≥ 1), `slotFreeDelay` (int seconds, clamped ≥ 0); syncs `BurstMode` for rollback safety; auto-initializes `manualLimit` to soft cap when switching to manual with limit 0; triggers `ProcessQueue()` on any mode change; triggers debounced save
 - `(*Proxy) HandleKeysGet(w, r)` / `HandleKeysPost(w, r)` — `HandleKeysGet` acquires `configMu.RLock()`
 - `(*Proxy) HandleUsage(w, r)` / `HandleConcurrency(w, r)` — `HandleConcurrency` response includes `concurrency_limit_mode` and `manual_limit` fields; `FetchUsage`/`FetchUsageHistory` call `upstreamAPIKeyForDashboard()` before upstream calls
 - `(*Proxy) HandleUsageHistory(w, r)` / `HandleUser(w, r)` — `HandleUser` returns `user_id` from `LastConcurrency`
@@ -147,13 +175,16 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) HandleBingWallpaper(w, r)` — daily cache; calls `upgradePeapixResolution()` for UHD variant
 - `(*Proxy) HandleWallhavenWallpaper(w, r)` — hourly cache; `atleast=2560x1440` filter; uses `isValidImage` + `serveWallpaperImageTyped` with `imageContentType`
 
-### Opencode Config (§24)
-- `DiscoverOpencodeConfigs(homeDir string) []string` — only returns existing files
-- `(*Proxy) SetupOpencodeConfig(homeDir string, port int) bool` — no-op if no config exists
-
 ### Dashboard (dashboard.html)
 - **Concurrency Limit selector** — three-button group (Soft Cap / Hard Cap / Manual) replacing the old Burst Mode On/Off toggle. Soft Cap gates at the soft cap (Limit), Hard Cap gates at the hard cap (HardCap), Manual reveals a slider (1 to hard cap) for a custom concurrency limit. Frontend POSTs `concurrencyLimitMode` and `manualConcurrencyLimit` to `/api/config`; `loadConfig()` initializes the state from backend; `fetchConcurrency()` reads `concurrency_limit_mode` and `manual_limit` from the concurrency API response and dynamically updates the slider max/position
 - **Slot Free Delay input** — number input in Quick Settings for a positive integer (seconds, default 0). POSTs `slotFreeDelay` to `/api/config` on change
+- **Retry Attempts slider** — range slider (0–10, default 2) in Quick Settings. POSTs `retryAttempts` to `/api/config` on change. Shows live value.
+- **Backoff Strategy dropdown** — select in Quick Settings (hidden when retries=0). Options: Aggressive (1s→60s) or Conservative (5s→300s). POSTs `backoffStrategy` to `/api/config` on change. Shows delay sequence preview below.
+- **Request Timeout slider** — range slider (30s–30m, step 30s, default 15m) in Quick Settings. POSTs `requestTimeout` (seconds) to `/api/config` on change. Applied live via `Upstream.SetTimeout()` without restart.
+- **Priority card** — replaces the old Throttled card in the usage stat grid. Always visible. Shows "Low (reason)" in yellow when priority is low, "Normal" in white otherwise.
+- **Collapsed-by-default sections** — Quick Actions, Models, and Environment sections start collapsed (have `collapsed` class in HTML). Other sections (Quick Settings, Usage History, etc.) start expanded.
+- **Environment section** — shows Version (from `proxyData.version`), Runtime (Go version), Port, and Started At. The collapsed header preview text shows `v{version} · {runtime} · :{port}`.
+- **Header title** — "UMANS Dash Go" (was "UMANS Dash").
 - `setWallpaper(src, skipConfigSave)` — `skipConfigSave` parameter avoids redundant POST during init
 - `loadConfig()` — decoupled from `/healthz` (fetched in background, not awaited); hides loader before `fetchUsage()` (fire-and-forget)
 - `toggleSection()` — animates section collapse/expand via JS-driven height transition (`scrollHeight` → `0` and back); swaps `bi-chevron-down` ↔ `bi-chevron-right` icon classes. CSS `.collapsed` sets `height:0;opacity:0;padding:0`; `display:none` is applied inline by JS only after `transitionend` fires, so the collapse animation is visible
@@ -164,9 +195,9 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 ## Building
 
 ```bash
-go build ./...                     # Compile check
-go vet ./...                       # Static analysis
-go run .                           # Start the proxy
+go build ./... # Compile check
+go vet ./... # Static analysis
+go run . # Start the proxy
 ```
 
 ## Concurrency & Mutex Model
@@ -182,6 +213,7 @@ The `Proxy` struct holds several dedicated mutexes. Code touching these fields m
 | `rw.mu` (in `responseWriterTracker`) | Hijack/flush state | `Flush()` acquires `rw.mu`, checks `hijacked`, releases the lock, then calls `Flush()` — preventing flush-after-hijack panics. |
 | `lastClientKeyMu` (RWMutex) | `lastClientKey` | `Lock()` in `setLastClientKey`; `RLock()` in `getLastClientKey`. Tracks last-known-good client API key for usage/history calls when `ApiKeyMode` is `passthrough`/`smart`. |
 | `concurrencyLimitMu` (RWMutex) | `concurrencyLimitMode`, `manualLimit` | `Lock()` in `setConcurrencyLimitMode`/`setManualLimit`; `RLock()` in `getConcurrencyLimitMode`/`getManualLimit`. `gateLimit()` takes one `RLock` and reads both fields atomically. Gates `gateLimit()`: `soft` → soft cap (`Limit`), `hard` → hard cap (`HardCap`), `manual` → `manualLimit` clamped to `[1, HardCap]`. Restored from `Config.ConcurrencyLimitMode` in `NewProxy()`. |
+| `retryConfigMu` (RWMutex) | `retryAttempts`, `backoffStrategy` | `Lock()` in `setRetryConfig`; `RLock()` in `getRetryAttempts`/`getBackoffStrategy`. `getRetryAttempts()` uses `< 0` guard (not `<= 0`) so explicit 0 passes through. Restored from `Config.RetryAttempts` / `Config.BackoffStrategy` in `NewProxy()`. |
 
 **Graceful shutdown** (`Shutdown()`): polls `ActiveRequests` under `queueMu.RLock` every 100ms (5s timeout) before calling `httpServer.Shutdown()`, ensuring in-flight requests drain before the listener closes.
 

@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -30,14 +29,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 )
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
 const (
-	MaxRetries             = 10
-	RetryDelayMs           = 3000
 	MaxQueueSize           = 256
 	QueueFullErrorCode     = "queue_full"
 	MaxBodySize            = 5 * 1024 * 1024
@@ -47,10 +45,15 @@ const (
 	APIKeyEnvVar           = "UMANS_API_KEY"
 	ModelCatalogCacheTTL   = 5 * time.Minute
 	UsageCacheTTL          = 5 * time.Minute
-	OpencodeConfigCacheTTL = 5 * time.Minute
 	UpstreamModelsCacheTTL = 5 * time.Minute // §8.7
 	UserInfoCacheTTL       = 5 * time.Minute // §8.8
 	UserInfoCacheTimeout   = 10 * time.Second // §7.2 GetUserInfo timeout
+
+	// DefaultRetryAttempts is used when Config.RetryAttempts is nil (unset).
+	// Was hardcoded MaxRetries=10 before; now default 2 per user requirement.
+	DefaultRetryAttempts = 2
+	// MaxRetryAttemptsCap is the upper bound for the retry slider.
+	MaxRetryAttemptsCap = 10
 
 	// DEFAULT_VISION_HANDOFF_PROMPT is the system prompt for vision handoff
 	// image analysis when config.visionHandoffPrompt is empty (SPEC §11.7).
@@ -66,6 +69,14 @@ Cover:
 
 Write as a single coherent description, not a bulleted list. Be thorough but concise.`
 )
+
+// BackoffPresets maps strategy name → per-attempt delays (in seconds).
+// Index 0 = delay before attempt 2, index 1 = delay before attempt 3, etc.
+// If the preset has fewer entries than the retry count, the last value repeats.
+var BackoffPresets = map[string][]int{
+	"aggressive":   {1, 3, 5, 10, 15, 20, 25, 30, 45, 60},
+	"conservative": {5, 15, 30, 45, 60, 120, 180, 240, 300},
+}
 
 var ReasoningLevelBudgets = map[string]int{
 	"low":    8000,
@@ -115,6 +126,12 @@ func NewProxy(cfg *Config) *Proxy {
 	if cfg.ManualConcurrencyLimit > 0 {
 		p.setManualLimit(cfg.ManualConcurrencyLimit)
 	}
+	// Initialize retry config snapshot from loaded config.
+	retryAttempts := DefaultRetryAttempts
+	if cfg.RetryAttempts != nil {
+		retryAttempts = *cfg.RetryAttempts
+	}
+	p.setRetryConfig(retryAttempts, cfg.BackoffStrategy)
 
 	// §31 step 3: Initialize KeyPool.
 	if len(cfg.Keys) > 0 {
@@ -221,10 +238,11 @@ func ParseListenPort(addr string) int {
 }
 
 func DefaultConfig() Config {
+	defRetry := DefaultRetryAttempts
 	return Config{
 		ListenAddr:             "127.0.0.1:8084",
 		UpstreamBaseURL:        "https://api.code.umans.ai/v1",
-		RequestTimeout:         ParseDuration("300s"),
+		RequestTimeout:         ParseDuration("15m"),
 		OverrideConcurrency:    0,
 		MaxImages:              9,
 		VisionHandoffEnabled:   false,
@@ -234,6 +252,8 @@ func DefaultConfig() Config {
 		VisionHandoffCacheTtl:  ParseDuration("24h"),
 		WallpaperSource:        "bing",
 		ConcurrencyLimitMode:  "soft",
+		RetryAttempts:         &defRetry,
+		BackoffStrategy:       "aggressive",
 	}
 }
 
@@ -275,6 +295,16 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("VISION_HANDOFF_CACHE_TTL"); v != "" {
 		cfg.VisionHandoffCacheTtl = ParseDuration(v)
 	}
+	if v := os.Getenv("RETRY_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RetryAttempts = &n
+		}
+	}
+	if v := os.Getenv("BACKOFF_STRATEGY"); v != "" {
+		if _, ok := BackoffPresets[v]; ok {
+			cfg.BackoffStrategy = v
+		}
+	}
 }
 
 func LoadConfig() (Config, error) {
@@ -295,6 +325,20 @@ func LoadConfig() (Config, error) {
 	applyEnvOverrides(&cfg)
 	if cfg.RequestTimeout.Duration <= 0 {
 		log.Fatal("RequestTimeout must be positive")
+	}
+	// Migrate: old config.json files won't have RETRY_ATTEMPTS / BACKOFF_STRATEGY.
+	if cfg.RetryAttempts == nil {
+		def := DefaultRetryAttempts
+		cfg.RetryAttempts = &def
+	} else if *cfg.RetryAttempts < 0 || *cfg.RetryAttempts > MaxRetryAttemptsCap {
+		def := DefaultRetryAttempts
+		cfg.RetryAttempts = &def
+	}
+	if cfg.BackoffStrategy == "" {
+		cfg.BackoffStrategy = "aggressive"
+	}
+	if _, ok := BackoffPresets[cfg.BackoffStrategy]; !ok {
+		cfg.BackoffStrategy = "aggressive"
 	}
 	applyDefaultApiKeyMode(&cfg)
 	return cfg, nil
@@ -347,65 +391,6 @@ func debouncedSaveConfig(cfg Config) {
 	})
 }
 
-var (
-	opencodeTimer    *time.Timer
-	opencodeTimerMu  sync.Mutex
-	opencodeRunning  bool
-)
-
-var (
-	opencodeDiscoveryCache     []string
-	opencodeDiscoveryCacheHome string
-	opencodeDiscoveryCachedAt  time.Time
-	opencodeDiscoveryMu        sync.Mutex
-)
-
-func debouncedSetupOpencodeConfig(p *Proxy) {
-	opencodeTimerMu.Lock()
-	defer opencodeTimerMu.Unlock()
-	if opencodeTimer != nil {
-		opencodeTimer.Stop()
-	}
-	listenAddr := p.Config.ListenAddr
-	opencodeTimer = time.AfterFunc(500*time.Millisecond, func() {
-		opencodeTimerMu.Lock()
-		if opencodeRunning {
-			opencodeTimerMu.Unlock()
-			return
-		}
-		opencodeRunning = true
-		opencodeTimerMu.Unlock()
-
-		defer func() {
-			opencodeTimerMu.Lock()
-			opencodeRunning = false
-			opencodeTimerMu.Unlock()
-		}()
-
-		homeDir, _ := os.UserHomeDir()
-		port := ParseListenPort(listenAddr)
-		firstRun := p.SetupOpencodeConfig(homeDir, port)
-		if firstRun {
-			openBrowser(fmt.Sprintf("http://localhost:%d/", port))
-		}
-	})
-}
-
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	if cmd != nil {
-		_ = cmd.Start()
-	}
-}
-
 // ─── Upstream Client (§7) ───────────────────────────────────────────────────
 
 // NewUpstreamClient creates a new UpstreamClient with a keep-alive HTTP client.
@@ -413,12 +398,15 @@ func openBrowser(url string) {
 // The timeout is the default/client-level timeout; per-request timeouts are
 // enforced via context.WithTimeout in each method.
 func NewUpstreamClient(baseURL, apiKey string, timeout time.Duration) *UpstreamClient {
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
 	transport := &http.Transport{
 		DisableKeepAlives:   false,
 		MaxIdleConns:        128,
 		MaxIdleConnsPerHost: 128,
 		IdleConnTimeout:     60 * time.Second,
-		ResponseHeaderTimeout: 300 * time.Second,
+		ResponseHeaderTimeout: timeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
@@ -435,17 +423,28 @@ func NewUpstreamClient(baseURL, apiKey string, timeout time.Duration) *UpstreamC
 	}
 }
 
-// SetAPIKey updates the API key used for subsequent requests.
-// This supports per-request key rotation from the key pool (§3).
+// SetAPIKey updates the API key used for requests where no explicit key is provided.
+// NOTE: This is NOT safe for concurrent use with per-request key rotation.
+// Prefer passing the apiKey directly to ChatCompletions/Messages.
 func (u *UpstreamClient) SetAPIKey(key string) {
 	u.apiKey = key
+}
+
+// SetTimeout updates the request timeout for subsequent requests.
+// Also updates the transport's ResponseHeaderTimeout to match.
+func (u *UpstreamClient) SetTimeout(timeout time.Duration) {
+	u.timeout = timeout
+	u.httpClient.Timeout = timeout
+	if tr, ok := u.httpClient.Transport.(*http.Transport); ok {
+		tr.ResponseHeaderTimeout = timeout
+	}
 }
 
 // GetUserInfo fetches model/user info from upstream.
 // GET {baseURL}/models/info with Authorization: Bearer and Connection: keep-alive headers.
 // 10-second timeout enforced via context.
 // Returns parsed JSON as json.RawMessage.
-func (u *UpstreamClient) GetUserInfo() (json.RawMessage, error) {
+func (u *UpstreamClient) GetUserInfo(apiKey string) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -453,7 +452,7 @@ func (u *UpstreamClient) GetUserInfo() (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GetUserInfo: creating request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+u.apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := u.httpClient.Do(req)
@@ -483,7 +482,7 @@ func (u *UpstreamClient) GetUserInfo() (json.RawMessage, error) {
 // 10-second timeout enforced via context.
 // Returns the raw response body as json.RawMessage for the caller to unmarshal.
 // On non-2xx status, returns an error (caller handles fallback to cached data).
-func (u *UpstreamClient) GetUsage() (json.RawMessage, error) {
+func (u *UpstreamClient) GetUsage(apiKey string) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -491,7 +490,7 @@ func (u *UpstreamClient) GetUsage() (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GetUsage: creating request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+u.apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := u.httpClient.Do(req)
@@ -518,12 +517,12 @@ func (u *UpstreamClient) GetUsage() (json.RawMessage, error) {
 
 // ChatCompletions sends a chat completion request to upstream.
 // POST {baseURL}/chat/completions
-// Headers: Authorization: Bearer, Content-Type: application/json,
+// Headers: Authorization: Bearer {apiKey}, Content-Type: application/json,
 // Accept: text/event-stream (if stream) or application/json, Connection: keep-alive.
 // Timeout: u.timeout (set from config.requestTimeout at construction).
 // Returns raw *http.Response. Caller must defer resp.Body.Close().
-func (u *UpstreamClient) ChatCompletions(body []byte, isStream bool) (*http.Response, error) {
-	return u.doPost("/chat/completions", body, isStream, u.timeout)
+func (u *UpstreamClient) ChatCompletions(body []byte, isStream bool, apiKey string) (*http.Response, error) {
+	return u.doPost("/chat/completions", body, isStream, u.timeout, apiKey)
 }
 
 // Messages sends an Anthropic Messages API request to upstream.
@@ -531,14 +530,14 @@ func (u *UpstreamClient) ChatCompletions(body []byte, isStream bool) (*http.Resp
 // Same headers as ChatCompletions.
 // Timeout: u.timeout (set from config.requestTimeout at construction).
 // Returns raw *http.Response. Caller must defer resp.Body.Close().
-func (u *UpstreamClient) Messages(body []byte, isStream bool) (*http.Response, error) {
-	return u.doPost("/messages", body, isStream, u.timeout)
+func (u *UpstreamClient) Messages(body []byte, isStream bool, apiKey string) (*http.Response, error) {
+	return u.doPost("/messages", body, isStream, u.timeout, apiKey)
 }
 
 // doPost is the shared POST implementation for ChatCompletions and Messages.
 // It constructs and sends a POST request with the appropriate headers and
 // per-request timeout. The caller is responsible for closing resp.Body.
-func (u *UpstreamClient) doPost(path string, body []byte, isStream bool, timeout time.Duration) (*http.Response, error) {
+func (u *UpstreamClient) doPost(path string, body []byte, isStream bool, timeout time.Duration, apiKey string) (*http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.baseURL+path, bytes.NewReader(body))
@@ -547,7 +546,7 @@ func (u *UpstreamClient) doPost(path string, body []byte, isStream bool, timeout
 		return nil, fmt.Errorf("%s: creating request: %w", path, err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+u.apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	if isStream {
 		req.Header.Set("Accept", "text/event-stream")
@@ -1425,7 +1424,7 @@ func (p *Proxy) cacheHandoffDescription(dataURI, desc string) {
 // analyzeImageViaHandoff sends a single image to the vision handoff model and
 // returns a text description. It makes a non-streaming chatCompletions call
 // with the image as an image_url content part (SPEC §11.4).
-func (p *Proxy) analyzeImageViaHandoff(dataURI, handoffModel string) string {
+func (p *Proxy) analyzeImageViaHandoff(dataURI, handoffModel, apiKey string) string {
 	// Check handoff cache first (§11.4)
 	if p.Config.VisionHandoffCacheEnabled && p.ImageHandoffCache != nil {
 		hash := sha256Hash(dataURI)
@@ -1470,7 +1469,7 @@ func (p *Proxy) analyzeImageViaHandoff(dataURI, handoffModel string) string {
 		return fmt.Sprintf("[Image analysis failed: failed to marshal request: %s]", err.Error())
 	}
 
-	resp, err := p.Upstream.ChatCompletions(bodyBytes, false)
+	resp, err := p.Upstream.ChatCompletions(bodyBytes, false, apiKey)
 	if err != nil {
 		return fmt.Sprintf("[Image analysis failed: upstream request error: %s]", err.Error())
 	}
@@ -2097,35 +2096,48 @@ func redactWalk(o interface{}) interface{} {
 
 // ─── Retry Logic (§15) ─────────────────────────────────────────────────────
 
-// GetRetryDelay computes the escalating retry delay per SPEC §15.1.
-// Formula: RETRY_DELAY_MS + (3000 * (attempt - 1)) milliseconds.
-// Attempt 1→2: 3s, 2→3: 6s, 3→4: 9s, ...
-func GetRetryDelay(attempt int) time.Duration {
-	return time.Duration(RetryDelayMs+3000*(attempt-1)) * time.Millisecond
+// getRetryDelay returns the delay to sleep BEFORE attempt N+1, given that
+// attempt N just failed. Uses the configured BackoffPresets table.
+// attempt is 1-based: attempt=1 → delay before attempt 2.
+// If attempt exceeds the preset length, the last preset value repeats.
+func (p *Proxy) getRetryDelay(attempt int) time.Duration {
+	preset, ok := BackoffPresets[p.getBackoffStrategy()]
+	if !ok || len(preset) == 0 {
+		preset = BackoffPresets["aggressive"]
+	}
+	idx := attempt - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(preset) {
+		idx = len(preset) - 1
+	}
+	return time.Duration(preset[idx]) * time.Second
 }
 
-// RetryLoop executes fn up to MaxRetries times with escalating delays per SPEC §15.1.
-// The callback receives {attempt (1-based), isLast} and returns {retry, err}.
-//   - If err is non-nil, the loop aborts immediately and returns (false, err).
-//   - If retry is false, the loop returns (true, nil) — success.
-//   - If retry is true and attempt < MaxRetries, it sleeps GetRetryDelay(attempt)
-//     before the next attempt.
-//   - If retry is true and attempt == MaxRetries (isLast), the loop returns
-//     (true, nil).
-//
-// This mirrors the test-local testRetryLoop exactly, but without the test-only
-// testRetryDelay override — production always uses real delays.
-func RetryLoop(fn func(attempt int, isLast bool) (bool, error)) (bool, error) {
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		retry, err := fn(attempt, attempt == MaxRetries)
+// retryLoop executes fn up to p.getRetryAttempts() times with preset-driven
+// delays. Signature/semantics unchanged from the old free function:
+//   - err non-nil → abort, return (false, err)
+//   - retry=false → success, return (true, nil)
+//   - retry=true and attempt < max → sleep getRetryDelay(attempt), continue
+//   - retry=true and attempt == max (isLast) → return (true, nil)
+func (p *Proxy) retryLoop(fn func(attempt int, isLast bool) (bool, error)) (bool, error) {
+	maxAttempts := p.getRetryAttempts()
+	if maxAttempts <= 0 {
+		// Retries disabled — run exactly once, isLast=true.
+		_, err := fn(1, true)
+		return err == nil, err
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		retry, err := fn(attempt, attempt == maxAttempts)
 		if err != nil {
 			return false, err
 		}
 		if !retry {
 			return true, nil
 		}
-		if attempt < MaxRetries {
-			time.Sleep(GetRetryDelay(attempt))
+		if attempt < maxAttempts {
+			time.Sleep(p.getRetryDelay(attempt))
 		}
 	}
 	return true, nil
@@ -2452,17 +2464,13 @@ func WriteJSON(w http.ResponseWriter, status int, payload interface{}) {
 				Data:  fmt.Sprintf(`{"error":"failed to marshal JSON: %s"}`, err.Error()),
 			}
 			w.Write([]byte(errEv.Format()))
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
-			}
+			safeFlush(w)
 			return
 		}
 		w.Write([]byte("data: "))
 		w.Write(b)
 		w.Write([]byte("\n\n"))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+		safeFlush(w)
 		return
 	}
 
@@ -2519,7 +2527,6 @@ func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Reque
 	defer body.Close()
 
 	ctx := r.Context()
-	flusher, _ := w.(http.Flusher)
 
 	totalWritten := 0
 	chunk := make([]byte, 4096)
@@ -2535,9 +2542,7 @@ func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Reque
 			if _, werr := w.Write(chunk[:n]); werr != nil {
 				return totalWritten, fmt.Errorf("pipeBodyToResponse: write to client failed: %w", werr)
 			}
-			if flusher != nil {
-				flusher.Flush()
-			}
+			safeFlush(w)
 			totalWritten += n
 		}
 		if err != nil {
@@ -2550,14 +2555,48 @@ func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Reque
 }
 
 func writeSSEHeaders(w http.ResponseWriter) {
+	// Idempotent: if Content-Type is already set to text/event-stream,
+	// headers have already been committed — don't call WriteHeader again.
+	if w.Header().Get("Content-Type") == "text/event-stream" {
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	safeFlush(w)
+}
+
+// safeFlush flushes the ResponseWriter if it implements http.Flusher.
+// It is panic-safe — recovers from any flush error (e.g. closed/hijacked connection).
+func safeFlush(w http.ResponseWriter) {
+	defer func() { recover() }()
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// writeSSEErrorEvent writes an SSE error event to an already-committed SSE stream.
+// This is used when the upstream pipe breaks mid-stream after headers have been sent
+// and the HTTP status code can no longer be changed. The error is sent as a
+// data event containing a JSON error object, followed by [DONE], so that
+// well-behaved SSE clients can detect the failure.
+// This function is panic-safe — it recovers from any panic (e.g. from writing
+// to a closed/hijacked connection) and silently swallows the error.
+func writeSSEErrorEvent(w http.ResponseWriter, errType, message string) {
+	defer func() { recover() }()
+	errJSON, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	w.Write([]byte("data: "))
+	w.Write(errJSON)
+	w.Write([]byte("\n\n"))
+	w.Write([]byte("data: [DONE]\n\n"))
+	safeFlush(w)
 }
 
 // FlushVisionHandoffKeepalive sends SSE headers (if not already sent) and a
@@ -2566,16 +2605,12 @@ func writeSSEHeaders(w http.ResponseWriter) {
 func (p *Proxy) FlushVisionHandoffKeepalive(w http.ResponseWriter) bool {
 	if w.Header().Get("Content-Type") == "text/event-stream" {
 		w.Write([]byte(": keepalive — analyzing image via vision handoff\n\n"))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+		safeFlush(w)
 		return false
 	}
 	writeSSEHeaders(w)
 	w.Write([]byte(": keepalive — analyzing image via vision handoff\n\n"))
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	safeFlush(w)
 	return true
 }
 
@@ -2738,13 +2773,12 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	var currentKeyIndex int
 	usingClientKey := false
 	clientKey := extractClientAPIKey(r)
+	currentKey := ""
 	mode := cfgMode
 	if (mode == "passthrough" || mode == "smart") && clientKey != "" {
 		// Pass-through or smart with a client key: use the client's key directly
 		usingClientKey = true
-		if p.Upstream != nil {
-			p.Upstream.SetAPIKey(clientKey)
-		}
+		currentKey = clientKey
 	} else if mode == "passthrough" {
 		// Pure passthrough with no client key — reject
 		if writeError != nil {
@@ -2762,11 +2796,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		currentKeyIndex = slot.Index
-	}
-
-	// Set the acquired key on the upstream client
-	if slot != nil && p.Upstream != nil {
-		p.Upstream.SetAPIKey(slot.Key)
+		currentKey = slot.Key
 	}
 
 	// slotName is used for error logging; empty if no slot
@@ -2876,7 +2906,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	// ═══════════════════════════════════════════════════════════════════════
 
 	if needsHandoff {
-		p.PerformVisionHandoff(payload, resolvedModel)
+		p.PerformVisionHandoff(payload, resolvedModel, currentKey)
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2894,7 +2924,25 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 
 	var lastStatus int
 
-	_, retryErr := RetryLoop(func(attempt int, isLast bool) (bool, error) {
+	headersCommitted := false // tracks whether SSE headers have been sent to client
+	_, retryErr := p.retryLoop(func(attempt int, isLast bool) (retry bool, err error) {
+		defer func() {
+			if rv := recover(); rv != nil {
+				stack := make([]byte, 4096)
+				n := runtime.Stack(stack, false)
+				log.Printf("PANIC in retry callback [attempt=%d isLast=%v headersCommitted=%v]: %v\n%s",
+					attempt, isLast, headersCommitted, rv, stack[:n])
+				err = fmt.Errorf("panic in retry callback: %v", rv)
+				retry = false
+			}
+		}()
+
+		// If we already committed SSE headers on a previous attempt, we cannot
+		// retry — the response is already in flight.
+		if headersCommitted {
+			return false, fmt.Errorf("response already committed (cannot retry after SSE headers sent)")
+		}
+
 		// ── Key rotation on retry (§15.3) ──
 		if attempt > 1 && !usingClientKey && p.KeyPool != nil && p.KeyPool.Total() > 1 {
 			p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
@@ -2904,9 +2952,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			}
 			currentKeyIndex = newSlot.Index
 			slotName = newSlot.Name
-			if p.Upstream != nil {
-				p.Upstream.SetAPIKey(newSlot.Key)
-			}
+			currentKey = newSlot.Key
 		}
 
 		// ── Execute upstream request (§19.12b) ──
@@ -2918,7 +2964,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			return false, nil
 		}
 
-		resp, err := p.Upstream.ChatCompletions(bodyBytes, isStream)
+		resp, err := p.Upstream.ChatCompletions(bodyBytes, isStream, currentKey)
 
 		// ── Network error → treated as 502 (§15.2) ──
 		if err != nil {
@@ -3036,17 +3082,21 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			}
 
 			// We have data — commit SSE headers and write the peeked bytes
-			if w.Header().Get("Content-Type") != "text/event-stream" {
-				writeSSEHeaders(w)
-			}
+			headersCommitted = true
+			writeSSEHeaders(w)
 			if peekN > 0 {
 				w.Write(peekBuf[:peekN])
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
+				safeFlush(w)
 			}
 			// Pipe the rest of the body
-			_, _ = pipeBodyToResponse(resp.Body, w, r)
+			_, pipeErr := pipeBodyToResponse(resp.Body, w, r)
+			if pipeErr != nil && !errors.Is(pipeErr, io.EOF) {
+				// Upstream pipe broke mid-stream after headers were committed.
+				// We can't retry (headers already sent) — write an SSE error
+				// event so the client knows the stream was interrupted.
+				writeSSEErrorEvent(w, "upstream_error", "upstream stream interrupted: "+pipeErr.Error())
+			}
+			return false, nil // done — cannot retry after committing SSE headers
 		} else {
 			// ── JSON response ──
 			respBody, readErr := readBodyText(resp.Body)
@@ -3064,16 +3114,13 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			if isStream {
 				// Streaming was requested but upstream returned JSON.
 				// Wrap as a single SSE chunk + [DONE]
-				if w.Header().Get("Content-Type") != "text/event-stream" {
-					writeSSEHeaders(w)
-				}
+				headersCommitted = true
+				writeSSEHeaders(w)
 				w.Write([]byte("data: "))
 				w.Write([]byte(respBody))
 				w.Write([]byte("\n\n"))
 				w.Write([]byte("data: [DONE]\n\n"))
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
+				safeFlush(w)
 			} else {
 				// Non-streaming JSON response
 				w.Header().Set("Content-Type", "application/json")
@@ -3086,7 +3133,12 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	})
 
 	if retryErr != nil && writeError != nil {
-		if w.Header().Get("Content-Type") != "text/event-stream" {
+		defer func() { recover() }()
+		if w.Header().Get("Content-Type") == "text/event-stream" {
+			// SSE headers already committed — can't change status code.
+			// Write an SSE error event so the client knows the stream failed.
+			writeSSEErrorEvent(w, "api_error", retryErr.Error())
+		} else {
 			writeError(w, http.StatusServiceUnavailable,
 				retryErr.Error(), "api_error", "")
 		}
@@ -3099,6 +3151,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	p.configMu.RLock()
 	cfgMode := p.Config.ApiKeyMode
 	cfgMaxImages := p.Config.MaxImages
+	cfgUpstreamURL := p.Config.UpstreamBaseURL
 	p.configMu.RUnlock()
 
 	w := item.Response
@@ -3115,13 +3168,12 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	var ok bool
 	usingClientKey := false
 	clientKey := extractClientAPIKey(r)
+	currentKey := ""
 	mode := cfgMode
 	if (mode == "passthrough" || mode == "smart") && clientKey != "" {
 		// Pass-through or smart with a client key: use the client's key directly
 		usingClientKey = true
-		if p.Upstream != nil {
-			p.Upstream.SetAPIKey(clientKey)
-		}
+		currentKey = clientKey
 	} else if mode == "passthrough" {
 		// Pure passthrough with no client key — reject
 		WriteAnthropicError(w, http.StatusUnauthorized,
@@ -3134,14 +3186,10 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 				"no available API keys", "overloaded_error")
 			return
 		}
+		currentKey = slot.Key
 	}
 
-	// STEP 2: Set upstream API key
-	if slot != nil && p.Upstream != nil {
-		p.Upstream.SetAPIKey(slot.Key)
-	}
-
-	// STEP 3: Session tracking (§20.2, §14.5)
+	// STEP 2: Session tracking (§20.2, §14.5)
 	var sessNum int64
 	if fp != "" {
 		existing := p.TouchConversation(fp)
@@ -3192,7 +3240,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		if isStream {
 			p.FlushVisionHandoffKeepalive(w)
 		}
-		p.PerformVisionHandoff(payload, resolvedModel)
+		p.PerformVisionHandoff(payload, resolvedModel, currentKey)
 	}
 
 	// STEP 7: Marshal payload
@@ -3208,67 +3256,140 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		return
 	}
 
-	// STEP 8: Upstream call (§20.6)
+	// STEP 8: Upstream call with retry (§20.6, §15)
 	if p.Upstream == nil {
 		WriteAnthropicError(w, http.StatusServiceUnavailable,
 			"upstream not configured", "api_error")
 		return
 	}
-	resp, err := p.Upstream.Messages(bodyBytes, isStream)
-	if err != nil {
-		// STEP 9: Network error → 502 (§20.9)
-		errBody := fmt.Sprintf(`{"error":{"type":"api_error","message":"upstream network error: %v"}}`, err)
-		WriteAnthropicPassthroughError(w, http.StatusBadGateway, errBody)
-		if p.KeyPool != nil && slot != nil {
-			p.KeyPool.MarkUnhealthy(slot.Index, http.StatusBadGateway)
-		}
-		return
+	currentKeyIndex := -1
+	if slot != nil {
+		currentKeyIndex = slot.Index
 	}
-	// NOTE: no defer resp.Body.Close() here — the success path is handled by
-	// pipeBodyToResponse (which has its own defer body.Close()), and the HTTP
-	// error path closes resp.Body explicitly below.
+	var lastStatus int
+	var lastErrBody string
+	headersCommitted := false
+	_, retryErr := p.retryLoop(func(attempt int, isLast bool) (retry bool, err error) {
+		defer func() {
+			if rv := recover(); rv != nil {
+				stack := make([]byte, 4096)
+				n := runtime.Stack(stack, false)
+				log.Printf("PANIC in anthropic retry callback [attempt=%d isLast=%v headersCommitted=%v]: %v\n%s",
+					attempt, isLast, headersCommitted, rv, stack[:n])
+				err = fmt.Errorf("panic in anthropic retry callback: %v", rv)
+				retry = false
+			}
+		}()
 
-	// STEP 10: HTTP error (§20.7)
-	if resp.StatusCode >= 400 {
-		errBodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxBodySize))
-		resp.Body.Close()
-		errBody := string(errBodyBytes)
+		// If we already committed headers on a previous attempt, we cannot retry.
+		if headersCommitted {
+			return false, fmt.Errorf("response already committed (cannot retry after headers sent)")
+		}
 
-		WriteAnthropicPassthroughError(w, resp.StatusCode, errBody)
+		// Key rotation on retry (§15.3) — mirrors OpenAI path
+		if attempt > 1 && !usingClientKey && p.KeyPool != nil && p.KeyPool.Total() > 1 {
+			p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
+			newSlot, ok := p.KeyPool.Acquire(-1)
+			if !ok {
+				return false, fmt.Errorf("no healthy keys available for retry")
+			}
+			currentKeyIndex = newSlot.Index
+			currentKey = newSlot.Key
+		}
 
-		// §20 line 913: Mark unhealthy ONLY on 503, NOT on 500
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			if p.KeyPool != nil && slot != nil {
-				p.KeyPool.MarkUnhealthy(slot.Index, http.StatusServiceUnavailable)
+		resp, err := p.Upstream.Messages(bodyBytes, isStream, currentKey)
+		if err != nil {
+			lastStatus = 502
+			if p.KeyPool != nil && currentKeyIndex >= 0 {
+				p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
+			}
+			_ = p.LogRetryableError(
+				attempt, isLast,
+				sessNum, "",
+				r.Method, r.URL.String(),
+				map[string][]string(r.Header), string(bodyBytes),
+				cfgUpstreamURL+"/messages", "POST",
+				map[string][]string{}, 502, "Bad Gateway", err.Error(),
+			)
+			lastErrBody = fmt.Sprintf(`{"error":{"type":"api_error","message":"upstream network error: %v"}}`, err)
+			return !isLast, nil // retry if not last (isLast → stop, !isLast → retry)
+		}
+
+		if resp.StatusCode >= 400 {
+			errBodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxBodySize))
+			resp.Body.Close()
+			errBody := string(errBodyBytes)
+
+			if IsRetryableStatus(resp.StatusCode) {
+				lastStatus = resp.StatusCode
+				lastErrBody = errBody
+				_ = p.LogRetryableError(
+					attempt, isLast,
+					sessNum, "",
+					r.Method, r.URL.String(),
+					map[string][]string(r.Header), string(bodyBytes),
+					cfgUpstreamURL+"/messages", "POST",
+					map[string][]string{}, resp.StatusCode, resp.Status, lastErrBody,
+				)
+				return !isLast, nil // retry (isLast → stop, !isLast → retry)
+			}
+
+			// Non-retryable: write immediately — do NOT set lastStatus/lastErrBody
+			WriteAnthropicPassthroughError(w, resp.StatusCode, errBody)
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				if p.KeyPool != nil && currentKeyIndex >= 0 {
+					p.KeyPool.MarkUnhealthy(currentKeyIndex, http.StatusServiceUnavailable)
+				}
+			}
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+				p.BumpThrottled()
+			}
+			return false, nil // success (handled) — stop retrying
+		}
+
+		// Success path — pipe response
+		if !usingClientKey && p.KeyPool != nil && currentKeyIndex >= 0 {
+			p.KeyPool.MarkHealthy(currentKeyIndex)
+		}
+		if (cfgMode == "passthrough" || cfgMode == "smart") && clientKey != "" {
+			p.setLastClientKey(clientKey)
+		}
+		ct := resp.Header.Get("Content-Type")
+		if ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		headersCommitted = true
+		w.WriteHeader(resp.StatusCode)
+		_, pipeErr := pipeBodyToResponse(resp.Body, w, r)
+		if pipeErr != nil && !errors.Is(pipeErr, io.EOF) {
+			if strings.Contains(ct, "text/event-stream") {
+				writeSSEErrorEvent(w, "upstream_error", "upstream stream interrupted: "+pipeErr.Error())
 			}
 		}
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
-			p.BumpThrottled()
-		}
-
+		return false, nil // success
+	})
+	if retryErr != nil {
+		WriteAnthropicError(w, http.StatusServiceUnavailable,
+			retryErr.Error(), "api_error")
 		return
 	}
-
-	// STEP 11: Success (§20.8)
-	if !usingClientKey && p.KeyPool != nil && slot != nil {
-		p.KeyPool.MarkHealthy(slot.Index)
+	// If all retries exhausted on retryable errors, return the last error
+	if lastStatus != 0 && lastErrBody != "" {
+		defer func() { recover() }()
+		WriteAnthropicPassthroughError(w, lastStatus, lastErrBody)
+		if lastStatus == http.StatusServiceUnavailable {
+			if p.KeyPool != nil && currentKeyIndex >= 0 {
+				p.KeyPool.MarkUnhealthy(currentKeyIndex, lastStatus)
+			}
+		}
+		if lastStatus == http.StatusTooManyRequests || lastStatus == http.StatusServiceUnavailable {
+			p.BumpThrottled()
+		}
+		return
 	}
-	// In passthrough/smart mode, record the client's key as last-known-good
-	if (cfgMode == "passthrough" || cfgMode == "smart") && clientKey != "" {
-		p.setLastClientKey(clientKey)
-	}
-
-	// Set headers (§20 line 916)
-	ct := resp.Header.Get("Content-Type")
-	if ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(resp.StatusCode)
-
-	// Pipe body to response (handles both streaming and non-streaming)
-	_, _ = pipeBodyToResponse(resp.Body, w, r)
+	return
 }
 
 // dispatchQueuedItem sends a queued item to the appropriate pipeline function.
@@ -3373,6 +3494,43 @@ func (p *Proxy) setManualLimit(limit int) {
 	p.concurrencyLimitMu.Lock()
 	p.manualLimit = limit
 	p.concurrencyLimitMu.Unlock()
+}
+
+// getRetryAttempts returns the configured retry count (thread-safe).
+// NOTE: The `< 0` guard (not `<= 0`) is required because RetryAttempts is a
+// *int — a user-explicit 0 must pass through as 0 (no retries). See §2.9
+// for the full rationale on the *int pointer design.
+func (p *Proxy) getRetryAttempts() int {
+	p.retryConfigMu.RLock()
+	defer p.retryConfigMu.RUnlock()
+	n := p.retryAttempts
+	if n < 0 {
+		n = DefaultRetryAttempts
+	}
+	if n > MaxRetryAttemptsCap {
+		n = MaxRetryAttemptsCap
+	}
+	return n
+}
+
+// getBackoffStrategy returns the configured backoff preset name (thread-safe).
+// Returns "aggressive" if empty.
+func (p *Proxy) getBackoffStrategy() string {
+	p.retryConfigMu.RLock()
+	defer p.retryConfigMu.RUnlock()
+	if p.backoffStrategy == "" {
+		return "aggressive"
+	}
+	return p.backoffStrategy
+}
+
+// setRetryConfig snapshots the retry config fields under retryConfigMu.
+// Called from NewProxy and HandleConfigPost.
+func (p *Proxy) setRetryConfig(attempts int, strategy string) {
+	p.retryConfigMu.Lock()
+	p.retryAttempts = attempts
+	p.backoffStrategy = strategy
+	p.retryConfigMu.Unlock()
 }
 
 // TryEnqueueOrDispatch attempts to dispatch a request immediately if under the
@@ -3531,11 +3689,9 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 		return data
 	}
 
-	// Fetch from upstream — set the dashboard API key before calling
-	if p.Upstream != nil {
-		p.Upstream.SetAPIKey(p.upstreamAPIKeyForDashboard())
-	}
-	raw, err := p.Upstream.GetUsage()
+	// Fetch from upstream — use the dashboard API key
+	dashKey := p.upstreamAPIKeyForDashboard()
+	raw, err := p.Upstream.GetUsage(dashKey)
 	if err != nil {
 		// On error/non-OK: return cached data or nil (§6.1)
 		log.Printf("FetchUsage: upstream fetch failed: %v", err)
@@ -3636,9 +3792,6 @@ func (p *Proxy) FetchUsageHistory(from, to, granularity, scope string, fresh boo
 			"buckets":     []interface{}{},
 		}
 	}
-
-	// Set the dashboard API key before fetching from upstream
-	p.Upstream.SetAPIKey(p.upstreamAPIKeyForDashboard())
 
 	// Build URL with query params
 	params := url.Values{}
@@ -3855,166 +4008,7 @@ func (p *Proxy) BumpThrottled() {
 	p.queueMu.Unlock()
 }
 
-// ─── Opencode Config (§24) ─────────────────────────────────────────────────
-
-func DiscoverOpencodeConfigs(homeDir string) []string {
-	opencodeDiscoveryMu.Lock()
-	defer opencodeDiscoveryMu.Unlock()
-	if opencodeDiscoveryCache != nil && opencodeDiscoveryCacheHome == homeDir && time.Since(opencodeDiscoveryCachedAt) < OpencodeConfigCacheTTL {
-		return opencodeDiscoveryCache
-	}
-
-	var result []string
-	seen := map[string]bool{}
-	addIfExists := func(p string) {
-		if _, err := os.Stat(p); err == nil {
-			if !seen[p] {
-				result = append(result, p)
-				seen[p] = true
-			}
-		}
-	}
-
-	if runtime.GOOS == "windows" {
-		// Scan C:\Users\* for opencode configs
-		usersDir := `C:\Users`
-		entries, err := os.ReadDir(usersDir)
-		if err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				userPath := filepath.Join(usersDir, entry.Name())
-				addIfExists(filepath.Join(userPath, ".opencode", "opencode.json"))
-				addIfExists(filepath.Join(userPath, ".config", "opencode", "opencode.json"))
-			}
-		}
-		// Also check systemprofile
-		addIfExists(filepath.Join(`C:\Windows\System32\config\systemprofile`, ".opencode", "opencode.json"))
-		addIfExists(filepath.Join(`C:\Windows\System32\config\systemprofile`, ".config", "opencode", "opencode.json"))
-	} else {
-		addIfExists(filepath.Join(homeDir, ".config", "opencode", "opencode.json"))
-		addIfExists(filepath.Join(homeDir, ".opencode", "opencode.json"))
-	}
-
-	opencodeDiscoveryCache = result
-	opencodeDiscoveryCacheHome = homeDir
-	opencodeDiscoveryCachedAt = time.Now()
-	return result
-}
-
-func (p *Proxy) SetupOpencodeConfig(homeDir string, port int) bool {
-	paths := DiscoverOpencodeConfigs(homeDir)
-	firstRun := false
-	for _, configFile := range paths {
-		existing := map[string]interface{}{}
-		fileExisted := false
-		if content, err := os.ReadFile(configFile); err == nil {
-			if err := json.Unmarshal(content, &existing); err != nil {
-				log.Printf("opencode config %s: invalid JSON, starting fresh: %v", configFile, err)
-				existing = map[string]interface{}{}
-			}
-			fileExisted = true
-		}
-		if fileExisted {
-			backupPath := filepath.Join(filepath.Dir(configFile), "openconfig.b4umans.json")
-			if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-				content, _ := os.ReadFile(configFile)
-				os.WriteFile(backupPath, content, 0644)
-				firstRun = true
-			}
-		} else {
-			continue
-		}
-		models := map[string]interface{}{}
-		for _, m := range p.GetEffectiveModels() {
-			info := p.ModelInfoMap[m]
-			dn := p.DisplayNameMap[m]
-			if dn == "" {
-				dn = strings.TrimPrefix(m, "umans-")
-			}
-			reasoning := true
-			if mode := InferReasoningModeFromCapabilities(info.Capabilities.Reasoning); mode != nil {
-				reasoning = *mode
-			}
-			entry := map[string]interface{}{
-				"id":          m,
-				"name":        dn,
-				"reasoning":   reasoning,
-				"temperature": true,
-			}
-			if cw, ok := toInt(info.Capabilities.ContextWindow); ok && cw > 0 {
-				outputLimit := cw
-				if rmt, ok := toInt(info.Capabilities.RecommendedMaxTokens); ok && rmt > 0 {
-					outputLimit = rmt
-				} else if mct, ok := toInt(info.Capabilities.MaxCompletionTokens); ok && mct > 0 {
-					outputLimit = mct
-				}
-				entry["limit"] = map[string]interface{}{
-					"context": cw,
-					"output":  outputLimit,
-				}
-			}
-			if st, ok := info.Capabilities.SupportsTools.(bool); ok {
-				entry["tool_call"] = st
-			}
-			if sv, ok := info.Capabilities.SupportsVision.(bool); ok {
-				entry["attachment"] = sv
-			}
-			inputMods := []string{"text"}
-			if sv, ok := info.Capabilities.SupportsVision.(bool); ok && sv {
-				inputMods = append(inputMods, "image")
-			}
-			entry["modalities"] = map[string]interface{}{
-				"input":  inputMods,
-				"output": []string{"text"},
-			}
-			if variants := BuildReasoningVariants(info.Capabilities.Reasoning); variants != nil {
-				entry["variants"] = variants
-			}
-			models[m] = entry
-		}
-		provider, ok := existing["provider"].(map[string]interface{})
-		if !ok {
-			provider = map[string]interface{}{}
-		}
-		provider["umans"] = map[string]interface{}{
-			"npm":  "@ai-sdk/openai-compatible",
-			"name": "Umans.AI-Dash",
-			"options": map[string]interface{}{
-				"baseURL": fmt.Sprintf("http://localhost:%d/v1", port),
-				"apiKey":  firstProxyAPIKey(p.Config),
-			},
-			"models": models,
-		}
-		existing["provider"] = provider
-		instructions, ok := existing["instructions"].([]interface{})
-		if !ok {
-			instructions = []interface{}{}
-		}
-		for _, g := range []string{"AGENTS.md", "skills.md"} {
-			found := false
-			for _, inst := range instructions {
-				if inst == g {
-					found = true
-					break
-				}
-			}
-			if !found {
-				instructions = append(instructions, g)
-			}
-		}
-		existing["instructions"] = instructions
-		b, err := json.MarshalIndent(existing, "", "  ")
-		if err != nil {
-			log.Printf("opencode config %s: failed to marshal: %v", configFile, err)
-			continue
-		}
-		os.WriteFile(configFile, b, 0644)
-		log.Printf("opencode config written: %s (%d models)", configFile, len(models))
-	}
-	return firstRun
-}
+// ─── HTTP Handlers (§17-§29) ───────────────────────────────────────────────
 
 func toInt(v interface{}) (int, bool) {
 	switch n := v.(type) {
@@ -4025,26 +4019,6 @@ func toInt(v interface{}) (int, bool) {
 	}
 	return 0, false
 }
-
-func firstProxyAPIKey(cfg *Config) string {
-	if cfg == nil {
-		return "umans-proxy"
-	}
-	if cfg.APIKey != "" {
-		return cfg.APIKey
-	}
-	if len(cfg.APIKeys) > 0 && cfg.APIKeys[0] != "" {
-		return cfg.APIKeys[0]
-	}
-	for _, k := range cfg.Keys {
-		if k.Key != "" {
-			return k.Key
-		}
-	}
-	return "umans-proxy"
-}
-
-// ─── HTTP Handlers (§17-§29) ───────────────────────────────────────────────
 
 func (p *Proxy) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -4376,6 +4350,9 @@ func (p *Proxy) HandleConfigGet(w http.ResponseWriter, r *http.Request) {
 		"concurrencyLimitMode":      p.getConcurrencyLimitMode(),
 		"manualConcurrencyLimit":     p.getManualLimit(),
 		"slotFreeDelay":              p.Config.SlotFreeDelay,
+		"retryAttempts":              p.getRetryAttempts(),
+		"backoffStrategy":            p.getBackoffStrategy(),
+		"requestTimeout":             p.Config.RequestTimeout.DurationMs() / 1000,
 	})
 }
 
@@ -4526,6 +4503,36 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 		p.Config.SlotFreeDelay = delay
 	}
+	if v, ok := data["retryAttempts"].(float64); ok {
+		attempts := int(v)
+		if attempts < 0 {
+			attempts = 0
+		}
+		if attempts > MaxRetryAttemptsCap {
+			attempts = MaxRetryAttemptsCap
+		}
+		p.Config.RetryAttempts = &attempts
+		p.setRetryConfig(attempts, p.getBackoffStrategy())
+	}
+	if v, ok := data["backoffStrategy"].(string); ok {
+		if _, ok2 := BackoffPresets[v]; ok2 {
+			p.Config.BackoffStrategy = v
+			p.setRetryConfig(p.getRetryAttempts(), v)
+		}
+	}
+	if v, ok := data["requestTimeout"].(float64); ok {
+		secs := int(v)
+		if secs < 30 {
+			secs = 30
+		}
+		if secs > 1800 { // 30 minutes
+			secs = 1800
+		}
+		p.Config.RequestTimeout = Duration{time.Duration(secs) * time.Second}
+		if p.Upstream != nil {
+			p.Upstream.SetTimeout(p.Config.RequestTimeout.Duration)
+		}
+	}
 	if v, ok := data["keys"].([]interface{}); ok {
 		keys := make([]KeyConfig, 0, len(v))
 		for _, k := range v {
@@ -4547,7 +4554,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		p.KeyPool = NewKeyPool(keys)
 	}
 	debouncedSaveConfig(*p.Config)
-	debouncedSetupOpencodeConfig(p)
+
 	WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"success":                   true,
 		"listenAddr":                p.Config.ListenAddr,
@@ -4567,6 +4574,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		"concurrencyLimitMode":   p.getConcurrencyLimitMode(),
 		"manualConcurrencyLimit": p.getManualLimit(),
 		"slotFreeDelay":            p.Config.SlotFreeDelay,
+		"retryAttempts":            p.getRetryAttempts(),
+		"backoffStrategy":          p.getBackoffStrategy(),
+		"requestTimeout":           p.Config.RequestTimeout.DurationMs() / 1000,
 		"restartRequired":           restartRequired,
 	})
 }
@@ -4626,7 +4636,7 @@ func (p *Proxy) HandleKeysPost(w http.ResponseWriter, r *http.Request) {
 		}
 		p.KeyPool = NewKeyPool(p.Config.Keys)
 		debouncedSaveConfig(*p.Config)
-		debouncedSetupOpencodeConfig(p)
+	
 		WriteJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"keys":    maskKeysForResponse(p.Config.Keys),
@@ -4652,7 +4662,7 @@ func (p *Proxy) HandleKeysPost(w http.ResponseWriter, r *http.Request) {
 		}
 		p.KeyPool = NewKeyPool(p.Config.Keys)
 		debouncedSaveConfig(*p.Config)
-		debouncedSetupOpencodeConfig(p)
+	
 		WriteJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"keys":    maskKeysForResponse(p.Config.Keys),
@@ -4676,7 +4686,7 @@ func (p *Proxy) HandleKeysPost(w http.ResponseWriter, r *http.Request) {
 		}
 		p.KeyPool = NewKeyPool(p.Config.Keys)
 		debouncedSaveConfig(*p.Config)
-		debouncedSetupOpencodeConfig(p)
+	
 		WriteJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"keys":    maskKeysForResponse(p.Config.Keys),
@@ -5283,7 +5293,7 @@ func (p *Proxy) HandleWallhavenWallpaper(w http.ResponseWriter, r *http.Request)
 // PerformVisionHandoff replaces images with text descriptions from the handoff
 // model (SPEC §11.5). It accepts optional pre-collected image parts via variadic
 // to avoid re-scanning the payload when parts have already been collected.
-func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedModel string, preCollectedParts ...[]ImagePart) int {
+func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedModel string, apiKey string, preCollectedParts ...[]ImagePart) int {
 	if !p.NeedsVisionHandoff(resolvedModel) {
 		return 0
 	}
@@ -5314,7 +5324,7 @@ func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedMod
 				descriptions[idx] = p.HandoffResponse
 				return
 			}
-			descriptions[idx] = p.analyzeImageViaHandoff(dataURI, handoffModel)
+			descriptions[idx] = p.analyzeImageViaHandoff(dataURI, handoffModel, apiKey)
 		}(i, parts[i].DataURI)
 	}
 	wg.Wait()
@@ -5334,42 +5344,77 @@ func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedMod
 	return len(parts)
 }
 
-// getDashboardHtml reads dashboard.html with mtime-based caching.
-// It looks in the binary's directory first (spec-compliant), then falls
-// back to CWD (test-compatible). Returns nil on read error.
-func (p *Proxy) getDashboardHtml() []byte {
-	var candidates []string
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "dashboard.html"))
+// dashboardTemplateData holds values injected into the HTML/JS templates at serve time.
+type dashboardTemplateData struct {
+	Version              string
+	BackoffPresets       string // JSON-encoded
+	DefaultRetryAttempts int
+	DefaultRequestTimeout int // seconds
+}
+
+// renderDashboard renders the dashboard HTML template with injected values.
+// Caches the rendered output on first call. Falls back to raw bytes on parse error.
+func (p *Proxy) renderDashboard() []byte {
+	p.dashMu.Lock()
+	defer p.dashMu.Unlock()
+	if p.dashRendered != nil {
+		return p.dashRendered
 	}
-	candidates = append(candidates, "dashboard.html") // CWD fallback
-	candidates = append(candidates, filepath.Join("..", "dashboard.html")) // parent of CWD (test-compatible)
-
-	for _, path := range candidates {
-		info, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-
-		p.dashMu.Lock()
-		if p.dashHtml != nil && p.dashMtime.Equal(info.ModTime()) {
-			cached := p.dashHtml
-			p.dashMu.Unlock()
-			return cached
-		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			p.dashHtml = nil
-			p.dashMu.Unlock()
-			continue // try next candidate
-		}
-		p.dashHtml = data
-		p.dashMtime = info.ModTime()
-		p.dashMu.Unlock()
-		return data
+	if len(p.DashboardHTML) == 0 {
+		return nil
 	}
-	return nil
+	tmpl, err := template.New("dashboard").Parse(string(p.DashboardHTML))
+	if err != nil {
+		// Template parse error — serve raw HTML
+		p.dashRendered = p.DashboardHTML
+		return p.dashRendered
+	}
+	presetsJSON, _ := json.Marshal(BackoffPresets)
+	data := dashboardTemplateData{
+		Version:               p.Version,
+		BackoffPresets:        string(presetsJSON),
+		DefaultRetryAttempts:  DefaultRetryAttempts,
+		DefaultRequestTimeout: int(p.Config.RequestTimeout.Duration.Seconds()),
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		p.dashRendered = p.DashboardHTML
+		return p.dashRendered
+	}
+	p.dashRendered = buf.Bytes()
+	return p.dashRendered
+}
+
+// renderDashboardJS renders the dashboard JS template with injected values.
+// Caches the rendered output on first call. Falls back to raw bytes on parse error.
+func (p *Proxy) renderDashboardJS() []byte {
+	p.dashMu.Lock()
+	defer p.dashMu.Unlock()
+	if p.dashJsRendered != nil {
+		return p.dashJsRendered
+	}
+	if len(p.DashboardJS) == 0 {
+		return nil
+	}
+	tmpl, err := template.New("dashboardJS").Parse(string(p.DashboardJS))
+	if err != nil {
+		p.dashJsRendered = p.DashboardJS
+		return p.dashJsRendered
+	}
+	presetsJSON, _ := json.Marshal(BackoffPresets)
+	data := dashboardTemplateData{
+		Version:               p.Version,
+		BackoffPresets:        string(presetsJSON),
+		DefaultRetryAttempts:  DefaultRetryAttempts,
+		DefaultRequestTimeout: int(p.Config.RequestTimeout.Duration.Seconds()),
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		p.dashJsRendered = p.DashboardJS
+		return p.dashJsRendered
+	}
+	p.dashJsRendered = buf.Bytes()
+	return p.dashJsRendered
 }
 
 // ServeHTTP implements http.Handler for the Proxy. It wraps HandleRequest
@@ -5472,7 +5517,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case path == "/" || path == "/dashboard":
-		html := p.getDashboardHtml()
+		html := p.renderDashboard()
 		if html == nil {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -5509,6 +5554,16 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(rendered))
+	case path == "/dashboard.js":
+		js := p.renderDashboardJS()
+		if js == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		w.Write(js)
 	case path == "/healthz":
 		p.HandleHealthz(w, r)
 	case path == "/v1/models/info":
