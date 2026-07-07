@@ -2560,6 +2560,16 @@ func writeSSEHeaders(w http.ResponseWriter) {
 	if w.Header().Get("Content-Type") == "text/event-stream" {
 		return
 	}
+	// Guard against superfluous WriteHeader: if the responseWriterTracker
+	// has already written (e.g. timeout middleware wrote a 504), skip.
+	if tw, ok := w.(*responseWriterTracker); ok {
+		tw.mu.Lock()
+		alreadyWritten := tw.written || tw.hijacked
+		tw.mu.Unlock()
+		if alreadyWritten {
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
