@@ -536,7 +536,7 @@ type responseWriterTracker struct {
 func (rw *responseWriterTracker) WriteHeader(code int) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	if rw.hijacked {
+	if rw.hijacked || rw.written {
 		return
 	}
 	rw.written = true
