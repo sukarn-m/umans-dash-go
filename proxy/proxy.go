@@ -153,6 +153,17 @@ func NewProxy(cfg *Config) *Proxy {
 	// §31 step 5: Set exitFn for restart shutdown.
 	p.exitFn = os.Exit
 
+	// §7.6: shared catalog client
+	p.catalogClient = &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: false,
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 32,
+			IdleConnTimeout:     60 * time.Second,
+		},
+	}
+
 	// §31 step 6a: Validate API key (non-fatal).
 	if p.Upstream != nil && cfg.APIKey != "" {
 		if !p.ValidateApiKey() {
@@ -250,6 +261,7 @@ func DefaultConfig() Config {
 		VisionHandoffPrompt:    "",
 		VisionHandoffCacheEnabled: false,
 		VisionHandoffCacheTtl:  ParseDuration("24h"),
+		VisionHandoffConcurrency: 4,
 		WallpaperSource:        "bing",
 		ConcurrencyLimitMode:  "soft",
 		RetryAttempts:         &defRetry,
@@ -521,8 +533,8 @@ func (u *UpstreamClient) GetUsage(apiKey string) (json.RawMessage, error) {
 // Accept: text/event-stream (if stream) or application/json, Connection: keep-alive.
 // Timeout: u.timeout (set from config.requestTimeout at construction).
 // Returns raw *http.Response. Caller must defer resp.Body.Close().
-func (u *UpstreamClient) ChatCompletions(body []byte, isStream bool, apiKey string) (*http.Response, error) {
-	return u.doPost("/chat/completions", body, isStream, u.timeout, apiKey)
+func (u *UpstreamClient) ChatCompletions(ctx context.Context, body []byte, isStream bool, apiKey string) (*http.Response, error) {
+	return u.doPost(ctx, "/chat/completions", body, isStream, u.timeout, apiKey)
 }
 
 // Messages sends an Anthropic Messages API request to upstream.
@@ -530,19 +542,22 @@ func (u *UpstreamClient) ChatCompletions(body []byte, isStream bool, apiKey stri
 // Same headers as ChatCompletions.
 // Timeout: u.timeout (set from config.requestTimeout at construction).
 // Returns raw *http.Response. Caller must defer resp.Body.Close().
-func (u *UpstreamClient) Messages(body []byte, isStream bool, apiKey string) (*http.Response, error) {
-	return u.doPost("/messages", body, isStream, u.timeout, apiKey)
+func (u *UpstreamClient) Messages(ctx context.Context, body []byte, isStream bool, apiKey string) (*http.Response, error) {
+	return u.doPost(ctx, "/messages", body, isStream, u.timeout, apiKey)
 }
 
 // doPost is the shared POST implementation for ChatCompletions and Messages.
 // It constructs and sends a POST request with the appropriate headers and
 // per-request timeout. The caller is responsible for closing resp.Body.
-func (u *UpstreamClient) doPost(path string, body []byte, isStream bool, timeout time.Duration, apiKey string) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (u *UpstreamClient) doPost(ctx context.Context, path string, body []byte, isStream bool, timeout time.Duration, apiKey string) (*http.Response, error) {
+	var cancel context.CancelFunc
+	if !isStream && timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.baseURL+path, bytes.NewReader(body))
 	if err != nil {
-		cancel()
 		return nil, fmt.Errorf("%s: creating request: %w", path, err)
 	}
 
@@ -557,12 +572,14 @@ func (u *UpstreamClient) doPost(path string, body []byte, isStream bool, timeout
 
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
-		cancel()
 		return nil, fmt.Errorf("%s: executing request: %w", path, err)
 	}
 
 	// Wrap body to call cancel on Close, ensuring context resources are released.
-	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	// The cancel function may be nil for streaming requests (no WithTimeout created).
+	if cancel != nil {
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	}
 	return resp, nil
 }
 
@@ -913,14 +930,8 @@ func ApplyAutoThink(payload map[string]interface{}, reasoningCaps interface{}) {
 // ─── Model Catalog (§8) ────────────────────────────────────────────────────
 
 func (p *Proxy) ApplyCatalogData(data map[string]interface{}) {
-	p.catalogMu.Lock()
-	defer p.catalogMu.Unlock()
-	if p.ModelInfoMap == nil {
-		p.ModelInfoMap = map[string]ModelInfo{}
-	}
-	if p.DisplayNameMap == nil {
-		p.DisplayNameMap = map[string]string{}
-	}
+	newModelInfo := map[string]ModelInfo{}
+	newDisplayNames := map[string]string{}
 	for id, info := range data {
 		infoMap, ok := info.(map[string]interface{})
 		if !ok {
@@ -929,7 +940,7 @@ func (p *Proxy) ApplyCatalogData(data map[string]interface{}) {
 		mi := ModelInfo{}
 		if dn, ok := infoMap["display_name"].(string); ok {
 			mi.DisplayName = dn
-			p.DisplayNameMap[id] = stripUmansPrefix(dn)
+			newDisplayNames[id] = stripUmansPrefix(dn)
 		}
 		if caps, ok := infoMap["capabilities"].(map[string]interface{}); ok {
 			mi.Capabilities = Capabilities{
@@ -941,8 +952,12 @@ func (p *Proxy) ApplyCatalogData(data map[string]interface{}) {
 				Reasoning:            caps["reasoning"],
 			}
 		}
-		p.ModelInfoMap[id] = mi
+		newModelInfo[id] = mi
 	}
+	p.catalogMu.Lock()
+	p.ModelInfoMap = newModelInfo
+	p.DisplayNameMap = newDisplayNames
+	p.catalogMu.Unlock()
 }
 
 func stripUmansPrefix(name string) string {
@@ -964,42 +979,47 @@ func (p *Proxy) GetModelDisplayName(id string) string {
 func (p *Proxy) GetOrderedModelIds() []string {
 	p.catalogMu.RLock()
 	defer p.catalogMu.RUnlock()
-	var ids []string
+	out := make([]string, 0, len(p.ModelInfoMap))
 	for id := range p.ModelInfoMap {
-		ids = append(ids, id)
+		out = append(out, id)
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		di := p.DisplayNameMap[ids[i]]
+	sort.Slice(out, func(i, j int) bool {
+		di := p.DisplayNameMap[out[i]]
 		if di == "" {
-			di = ids[i]
+			di = out[i]
 		}
-		dj := p.DisplayNameMap[ids[j]]
+		dj := p.DisplayNameMap[out[j]]
 		if dj == "" {
-			dj = ids[j]
+			dj = out[j]
 		}
 		di = strings.ToLower(di)
 		dj = strings.ToLower(dj)
 		if di != dj {
 			return di < dj
 		}
-		return ids[i] < ids[j]
+		return out[i] < out[j]
 	})
-	return ids
+	return out
 }
 
 func (p *Proxy) GetEffectiveModels() []string {
+	p.configMu.RLock()
+	disabled := p.Config.DisabledModels
+	enabled := p.Config.EnabledModels
+	p.configMu.RUnlock()
+
 	catalogIds := p.GetOrderedModelIds()
 	var all []string
 	if len(catalogIds) > 0 {
 		all = catalogIds
 	} else {
-		all = p.Config.EnabledModels
+		all = enabled
 	}
-	if len(p.DisabledModels) == 0 {
+	if len(disabled) == 0 {
 		return all
 	}
 	disabledSet := map[string]bool{}
-	for _, d := range p.DisabledModels {
+	for _, d := range disabled {
 		disabledSet[d] = true
 	}
 	var result []string
@@ -1022,10 +1042,6 @@ func (p *Proxy) FetchModelCatalog() (map[string]interface{}, error) {
 		baseURL = UmansAPIBase
 	}
 
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-	}
-
 	url := strings.TrimRight(baseURL, "/") + "/models/info"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -1038,7 +1054,7 @@ func (p *Proxy) FetchModelCatalog() (map[string]interface{}, error) {
 		req.Header.Set("Authorization", "Bearer "+p.Config.APIKey)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := p.catalogClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch model catalog: %w", err)
 	}
@@ -1061,105 +1077,51 @@ func (p *Proxy) FetchModelCatalog() (map[string]interface{}, error) {
 // SPEC §8.2: 5-min cache, dedup concurrent fetches, stale-cache fallback,
 // populates ModelInfoMap and DisplayNameMap.
 func (p *Proxy) GetCatalogData() (map[string]interface{}, error) {
-	// Fast path: check for valid cached data under read lock
-	p.mu.RLock()
-	if p.CatalogCache != nil && time.Since(p.CatalogCache.fetchedAt) < ModelCatalogCacheTTL {
-		data := p.CatalogCache.data
-		p.mu.RUnlock()
-		return data, nil
-	}
-	fetching := p.CatalogFetching
-	var doneCh chan struct{}
-	if fetching {
-		doneCh = p.CatalogFetchDone
-	}
-	p.mu.RUnlock()
-
-	// If a fetch is already in progress, wait for it
-	if fetching && doneCh != nil {
-		<-doneCh // block until fetch completes
+	result, err := p.catalogGroup.Do("catalog", func() (interface{}, error) {
+		// Fast path: check for valid cached data under read lock
 		p.mu.RLock()
-		if p.CatalogCache != nil {
-			data, err := p.CatalogCache.data, p.CatalogCache.fetchErr
+		if p.CatalogCache != nil && time.Since(p.CatalogCache.fetchedAt) < ModelCatalogCacheTTL {
+			data := p.CatalogCache.data
 			p.mu.RUnlock()
-			return data, err
+			return data, nil
 		}
 		p.mu.RUnlock()
-		return nil, fmt.Errorf("catalog fetch returned no data")
-	}
 
-	// We are the fetcher — acquire write lock and set up singleflight
-	p.mu.Lock()
-	// Double-check after acquiring write lock (another goroutine may have fetched)
-	if p.CatalogCache != nil && time.Since(p.CatalogCache.fetchedAt) < ModelCatalogCacheTTL {
-		data := p.CatalogCache.data
-		p.mu.Unlock()
-		return data, nil
-	}
-	// Check again if someone else started fetching
-	if p.CatalogFetching {
-		doneCh = p.CatalogFetchDone
-		p.mu.Unlock()
-		<-doneCh
+		// Save stale cache reference for fallback (outside the lock but before fetch)
 		p.mu.RLock()
-		if p.CatalogCache != nil {
-			data, err := p.CatalogCache.data, p.CatalogCache.fetchErr
-			p.mu.RUnlock()
-			return data, err
-		}
+		staleCache := p.CatalogCache
 		p.mu.RUnlock()
-		return nil, fmt.Errorf("catalog fetch returned no data")
-	}
-	// Mark ourselves as the fetcher
-	p.CatalogFetching = true
-	p.CatalogFetchDone = make(chan struct{})
-	// Save stale cache reference for fallback
-	var staleCache *catalogCache
-	if p.CatalogCache != nil {
-		stale := *p.CatalogCache
-		staleCache = &stale
-	}
-	p.mu.Unlock()
 
-	// Perform the fetch (outside the lock)
-	data, err := p.FetchModelCatalog()
-
-	p.mu.Lock()
-	// Store result (or error) in cache
-	if err != nil {
-		// On failure, fall back to stale cache if available
-		if staleCache != nil {
-			p.CatalogCache = staleCache
-		} else {
+		data, err := p.FetchModelCatalog()
+		p.mu.Lock()
+		if err != nil {
+			if staleCache != nil {
+				stale := *staleCache
+				p.CatalogCache = &stale
+				p.mu.Unlock()
+				return stale.data, nil
+			}
 			p.CatalogCache = &catalogCache{
 				data:      nil,
 				fetchedAt: time.Now(),
 				fetchErr:  err,
 			}
+			p.mu.Unlock()
+			return nil, err
 		}
-	} else {
 		p.CatalogCache = &catalogCache{
 			data:      data,
 			fetchedAt: time.Now(),
 			fetchErr:  nil,
 		}
-	}
-	// Signal all waiters
-	p.CatalogFetching = false
-	close(p.CatalogFetchDone)
-	p.CatalogFetchDone = nil
-	result := p.CatalogCache
-	p.mu.Unlock()
-
-	// Populate ModelInfoMap and DisplayNameMap OUTSIDE the lock to avoid deadlock
-	if err == nil && data != nil {
+		p.mu.Unlock()
 		p.ApplyCatalogData(data)
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	if result != nil {
-		return result.data, result.fetchErr
-	}
-	return nil, err
+	return result.(map[string]interface{}), nil
 }
 
 // GetAllCatalogModels returns all catalog model IDs (without disabled filter),
@@ -1266,14 +1228,10 @@ func (p *Proxy) ValidateApiKey() bool {
 		baseURL = UmansAPIBase
 	}
 
-	client := &http.Client{
-		Timeout: UserInfoCacheTimeout,
-	}
-
 	url := strings.TrimRight(baseURL, "/") + "/models/info"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ValidateApiKey: create request: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ValidateApiKey: *** request: %v\n", err)
 		return false
 	}
 	req.Header.Set("Connection", "keep-alive")
@@ -1282,9 +1240,9 @@ func (p *Proxy) ValidateApiKey() bool {
 		req.Header.Set("Authorization", "Bearer "+p.Config.APIKey)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := p.catalogClient.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ValidateApiKey: request failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ValidateApiKey: *** failed: %v\n", err)
 		return false
 	}
 	defer resp.Body.Close()
@@ -1424,7 +1382,7 @@ func (p *Proxy) cacheHandoffDescription(dataURI, desc string) {
 // analyzeImageViaHandoff sends a single image to the vision handoff model and
 // returns a text description. It makes a non-streaming chatCompletions call
 // with the image as an image_url content part (SPEC §11.4).
-func (p *Proxy) analyzeImageViaHandoff(dataURI, handoffModel, apiKey string) string {
+func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffModel, apiKey string) string {
 	// Check handoff cache first (§11.4)
 	if p.Config.VisionHandoffCacheEnabled && p.ImageHandoffCache != nil {
 		hash := sha256Hash(dataURI)
@@ -1469,7 +1427,7 @@ func (p *Proxy) analyzeImageViaHandoff(dataURI, handoffModel, apiKey string) str
 		return fmt.Sprintf("[Image analysis failed: failed to marshal request: %s]", err.Error())
 	}
 
-	resp, err := p.Upstream.ChatCompletions(bodyBytes, false, apiKey)
+	resp, err := p.Upstream.ChatCompletions(ctx, bodyBytes, false, apiKey)
 	if err != nil {
 		return fmt.Sprintf("[Image analysis failed: upstream request error: %s]", err.Error())
 	}
@@ -1900,7 +1858,11 @@ func FingerprintPayload(payload map[string]interface{}) string {
 	if !found {
 		return ""
 	}
-	return md5Hash(userText)[:12]
+	hash := md5Hash(userText)
+	if len(hash) < 12 {
+		return hash
+	}
+	return hash[:12]
 }
 
 func MsgText(m map[string]interface{}) string {
@@ -2105,6 +2067,9 @@ func (p *Proxy) getRetryDelay(attempt int) time.Duration {
 	if !ok || len(preset) == 0 {
 		preset = BackoffPresets["aggressive"]
 	}
+	if len(preset) == 0 {
+		return 1 * time.Second
+	}
 	idx := attempt - 1
 	if idx < 0 {
 		idx = 0
@@ -2308,7 +2273,7 @@ func (p *Proxy) LogRetryableError(
 			Method:  reqMethod,
 			URL:     reqURL,
 			Headers: RedactHeaders(reqHeaders),
-			Body:    RedactBodyJson(reqBody),
+			Body:    RedactBodyJson(truncateBody(reqBody, 4096)),
 		},
 		Upstream: ErrorLogUpstream{
 			URL:        upstreamURL,
@@ -2316,13 +2281,20 @@ func (p *Proxy) LogRetryableError(
 			Headers:    RedactHeaders(upstreamHeaders),
 			Status:     upstreamStatus,
 			StatusText: upstreamStatusText,
-			Body:       RedactBodyJson(upstreamBody),
+			Body:       RedactBodyJson(truncateBody(upstreamBody, 4096)),
 		},
 	}
 	return p.LogHttpError(record)
 }
 
 // ─── HTTP Helpers (§17) ────────────────────────────────────────────────────
+
+func truncateBody(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...[truncated]"
+}
 
 // extractClientAPIKey reads the bearer token or X-Api-Key from the client request.
 func extractClientAPIKey(req *http.Request) string {
@@ -2430,26 +2402,14 @@ func (p *Proxy) Authorized(req *http.Request) bool {
 }
 
 func ReadBody(req *http.Request) (string, error) {
-	var buf []byte
-	chunk := make([]byte, 4096)
-	total := 0
-	for {
-		n, err := req.Body.Read(chunk)
-		if n > 0 {
-			total += n
-			if total > MaxBodySize {
-				return "", fmt.Errorf("request body too large")
-			}
-			buf = append(buf, chunk[:n]...)
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return "", err
-		}
+	data, err := io.ReadAll(io.LimitReader(req.Body, int64(MaxBodySize)+1))
+	if err != nil {
+		return "", err
 	}
-	return string(buf), nil
+	if len(data) > MaxBodySize {
+		return "", fmt.Errorf("request body too large")
+	}
+	return string(data), nil
 }
 
 func WriteJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -2494,26 +2454,14 @@ func readBodyText(body io.ReadCloser) (string, error) {
 	if body == nil {
 		return "", nil
 	}
-	var buf []byte
-	chunk := make([]byte, 4096)
-	total := 0
-	for {
-		n, err := body.Read(chunk)
-		if n > 0 {
-			total += n
-			if total > MaxBodySize {
-				return "", fmt.Errorf("upstream response body exceeds MaxBodySize (%d bytes)", MaxBodySize)
-			}
-			buf = append(buf, chunk[:n]...)
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return "", fmt.Errorf("readBodyText: reading upstream body: %w", err)
-		}
+	data, err := io.ReadAll(io.LimitReader(body, int64(MaxBodySize)+1))
+	if err != nil {
+		return "", err
 	}
-	return string(buf), nil
+	if len(data) > MaxBodySize {
+		return "", fmt.Errorf("upstream response body exceeds MaxBodySize (%d bytes)", MaxBodySize)
+	}
+	return string(data), nil
 }
 
 // pipeBodyToResponse copies the upstream response body to the client,
@@ -2562,21 +2510,23 @@ func pipeBodyToResponse(body io.ReadCloser, w http.ResponseWriter, r *http.Reque
 }
 
 func writeSSEHeaders(w http.ResponseWriter) {
-	// Idempotent: if Content-Type is already set to text/event-stream,
-	// headers have already been committed — don't call WriteHeader again.
+	// If the response is already a streaming SSE response, we don't need to do
+	// anything. This is a convenience check only; the tracker path below is the
+	// authoritative guard.
 	if w.Header().Get("Content-Type") == "text/event-stream" {
 		return
 	}
-	// Guard against superfluous WriteHeader: if the responseWriterTracker
-	// has already written (e.g. timeout middleware wrote a 504), skip.
+
+	// Commit the SSE headers. If the writer is our tracker, use its atomic
+	// commit method to avoid bypassing the written/hijacked/aborted guards.
 	if tw, ok := w.(*responseWriterTracker); ok {
-		tw.mu.Lock()
-		alreadyWritten := tw.written || tw.hijacked
-		tw.mu.Unlock()
-		if alreadyWritten {
-			return
+		if tw.commitSSE() {
+			safeFlush(w)
 		}
+		return
 	}
+
+	// Fallback for non-tracker writers (tests).
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2711,13 +2661,15 @@ func WriteAnthropicPassthroughError(w http.ResponseWriter, status int, body stri
 	WriteAnthropicError(w, status, msg, errType)
 }
 
-// WriteQueueFullError writes a 503 queue_full error in the appropriate format.
+// WriteQueueFullError writes a 429 Too Many Requests queue_full error in the
+// appropriate format, with a Retry-After header to discourage immediate retries.
 func WriteQueueFullError(w http.ResponseWriter, format string) {
+	w.Header().Set("Retry-After", "2")
 	if format == "anthropic" {
-		WriteAnthropicError(w, http.StatusServiceUnavailable,
+		WriteAnthropicError(w, http.StatusTooManyRequests,
 			"The server is overloaded. Please retry later.", "overloaded_error")
 	} else {
-		WriteOpenAIError(w, http.StatusServiceUnavailable,
+		WriteOpenAIError(w, http.StatusTooManyRequests,
 			"The server is overloaded. Please retry later.",
 			"server_error", QueueFullErrorCode)
 	}
@@ -2923,7 +2875,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	// ═══════════════════════════════════════════════════════════════════════
 
 	if needsHandoff {
-		p.PerformVisionHandoff(payload, resolvedModel, currentKey)
+		p.PerformVisionHandoff(r.Context(), payload, resolvedModel, currentKey)
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -2981,7 +2933,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 			return false, nil
 		}
 
-		resp, err := p.Upstream.ChatCompletions(bodyBytes, isStream, currentKey)
+		resp, err := p.Upstream.ChatCompletions(r.Context(), bodyBytes, isStream, currentKey)
 
 		// ── Network error → treated as 502 (§15.2) ──
 		if err != nil {
@@ -3257,7 +3209,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		if isStream {
 			p.FlushVisionHandoffKeepalive(w)
 		}
-		p.PerformVisionHandoff(payload, resolvedModel, currentKey)
+		p.PerformVisionHandoff(r.Context(), payload, resolvedModel, currentKey)
 	}
 
 	// STEP 7: Marshal payload
@@ -3314,7 +3266,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 			currentKey = newSlot.Key
 		}
 
-		resp, err := p.Upstream.Messages(bodyBytes, isStream, currentKey)
+		resp, err := p.Upstream.Messages(r.Context(), bodyBytes, isStream, currentKey)
 		if err != nil {
 			lastStatus = 502
 			if p.KeyPool != nil && currentKeyIndex >= 0 {
@@ -3409,22 +3361,29 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	return
 }
 
-// dispatchQueuedItem sends a queued item to the appropriate pipeline function.
+// dispatchItem sends an item to the appropriate pipeline function.
 // proxyChatRequest/proxyAnthropicRequest are full implementations handling the
 // complete request lifecycle (key acquisition, normalization, retries, etc.).
-// The defer OnRequestComplete() ensures activeRequests is decremented regardless.
-func (p *Proxy) dispatchQueuedItem(item QueueItem) {
+// The defer OnRequestComplete() ensures activeRequests is decremented exactly
+// once per dispatched item.
+func (p *Proxy) dispatchItem(item *QueueItem) {
 	defer func() {
 		if rv := recover(); rv != nil {
 			stack := make([]byte, 4096)
 			n := runtime.Stack(stack, false)
-			log.Printf("PANIC recovered in dispatchQueuedItem: %v\n%s", rv, stack[:n])
+			log.Printf("PANIC recovered in dispatchItem: %v\n%s", rv, stack[:n])
 		}
 		p.OnRequestComplete()
 	}()
 
+	// Lightweight guard: if the response became committed/aborted after the slot
+	// was reserved, the slot will still be released by the defer above.
+	if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+		return
+	}
+
 	if item.Format == "anthropic" {
-		p.proxyAnthropicRequest(item)
+		p.proxyAnthropicRequest(*item)
 	} else {
 		p.proxyChatRequest(item.Response, item.Req, item.Payload, item.Model,
 			item.WriteError, item.WritePassthroughError)
@@ -3435,6 +3394,15 @@ func (p *Proxy) dispatchQueuedItem(item QueueItem) {
 // Returns -1 if no gate applies (both hard_cap and limit are nil).
 // Caller must NOT hold queueMu — this method does not acquire it.
 func (p *Proxy) gateLimit() int {
+	p.cachedGateMu.RLock()
+	if p.cachedGateAt.IsZero() || time.Since(p.cachedGateAt) > 1*time.Second {
+		p.cachedGateMu.RUnlock()
+	} else {
+		gate := p.cachedGate
+		p.cachedGateMu.RUnlock()
+		return gate
+	}
+
 	eff := p.GetEffectiveConcurrency(p.LastConcurrency)
 
 	p.concurrencyLimitMu.RLock()
@@ -3442,43 +3410,59 @@ func (p *Proxy) gateLimit() int {
 	manualLimit := p.manualLimit
 	p.concurrencyLimitMu.RUnlock()
 
+	var gate int
 	switch mode {
 	case "manual":
 		// If manualLimit is 0 (uninitialized), fall back to soft cap.
 		if manualLimit <= 0 {
 			if eff.Limit != nil {
-				return *eff.Limit
+				gate = *eff.Limit
+			} else if eff.HardCap != nil {
+				gate = *eff.HardCap
+			} else {
+				gate = 1
 			}
-			if eff.HardCap != nil {
-				return *eff.HardCap
+		} else {
+			// Clamp to [1, hardCap] if hardCap is available.
+			gate = manualLimit
+			if eff.HardCap != nil && gate > *eff.HardCap {
+				gate = *eff.HardCap
 			}
-			return -1
+			if gate < 1 {
+				gate = 1
+			}
 		}
-		// Clamp to [1, hardCap] if hardCap is available.
-		if eff.HardCap != nil && manualLimit > *eff.HardCap {
-			manualLimit = *eff.HardCap
-		}
-		if manualLimit < 1 {
-			manualLimit = 1
-		}
-		return manualLimit
 	case "hard":
 		if eff.HardCap != nil {
-			return *eff.HardCap
+			gate = *eff.HardCap
+		} else if eff.Limit != nil {
+			gate = *eff.Limit
+		} else {
+			gate = 1
 		}
-		if eff.Limit != nil {
-			return *eff.Limit
-		}
-		return -1
 	default: // "soft" or empty
 		if eff.Limit != nil {
-			return *eff.Limit
+			gate = *eff.Limit
+		} else if eff.HardCap != nil {
+			gate = *eff.HardCap
+		} else {
+			gate = 1
 		}
-		if eff.HardCap != nil {
-			return *eff.HardCap
-		}
-		return -1
 	}
+
+	p.cachedGateMu.Lock()
+	p.cachedGate = gate
+	p.cachedGateAt = time.Now()
+	p.cachedGateMu.Unlock()
+	return gate
+}
+
+// invalidateGateCache resets the cached gate limit.
+func (p *Proxy) invalidateGateCache() {
+	p.cachedGateMu.Lock()
+	p.cachedGate = 0
+	p.cachedGateAt = time.Time{}
+	p.cachedGateMu.Unlock()
 }
 
 // getConcurrencyLimitMode returns the current concurrency limit mode (thread-safe).
@@ -3554,25 +3538,42 @@ func (p *Proxy) setRetryConfig(attempts int, strategy string) {
 // concurrency gate, or enqueues it if capacity exists.
 //
 // Contract:
-//   - Returns true if the caller should proceed with direct dispatch.
-//     The caller MUST increment ActiveRequests before dispatching and MUST
-//     call OnRequestComplete() when done (which decrements and processes the queue).
-//   - Returns false if the request was enqueued or rejected (503).
-//     The caller must NOT increment ActiveRequests in this case; ProcessQueue
-//     handles incrementing when it dequeues and dispatches.
+//   - Returns true if the request was dispatched directly. ActiveRequests is
+//     already incremented; OnRequestComplete() is called by dispatchItem.
+//   - Returns false if the request was enqueued or rejected. The caller must
+//     NOT call OnRequestComplete() in this case.
 func (p *Proxy) TryEnqueueOrDispatch(item *QueueItem) bool {
 	p.queueMu.Lock()
-	defer p.queueMu.Unlock()
+
+	if p.shuttingDown.Load() {
+		p.queueMu.Unlock()
+		if item != nil && item.WriteError != nil && item.Response != nil {
+			item.WriteError(item.Response, http.StatusServiceUnavailable,
+				"server is shutting down", "server_error", "shutting_down")
+		}
+		return false
+	}
 
 	gate := p.gateLimit()
 
 	// No gate → dispatch immediately
 	if gate < 0 {
+		p.ActiveRequests++
+		p.queueMu.Unlock()
+		p.dispatchItem(item)
 		return true
 	}
 
 	// Under gate → dispatch immediately
 	if p.ActiveRequests < gate {
+		p.ActiveRequests++
+		p.queueMu.Unlock()
+		// Guard: if the client already disconnected/committed, release the slot.
+		if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+			p.OnRequestComplete()
+			return true
+		}
+		p.dispatchItem(item)
 		return true
 	}
 
@@ -3580,6 +3581,7 @@ func (p *Proxy) TryEnqueueOrDispatch(item *QueueItem) bool {
 	if len(p.requestQueue) >= MaxQueueSize {
 		// Queue full → reject with 503
 		p.ThrottledCount++
+		p.queueMu.Unlock()
 		if item != nil && item.WriteError != nil && item.Response != nil {
 			WriteQueueFullError(item.Response, item.Format)
 		}
@@ -3589,6 +3591,7 @@ func (p *Proxy) TryEnqueueOrDispatch(item *QueueItem) bool {
 	// Enqueue
 	p.requestQueue = append(p.requestQueue, *item)
 	p.QueueLen = len(p.requestQueue)
+	p.queueMu.Unlock()
 	return false
 }
 
@@ -3643,9 +3646,30 @@ func (p *Proxy) OnRequestComplete() {
 	p.ProcessQueue()
 }
 
+// rejectQueueLocked writes a 503 to every queued item and clears the queue.
+// Caller must hold queueMu.
+func (p *Proxy) rejectQueueLocked() {
+	for _, item := range p.requestQueue {
+		if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+			continue
+		}
+		if item.WriteError != nil {
+			item.WriteError(item.Response, http.StatusServiceUnavailable,
+				"server is shutting down", "server_error", "shutting_down")
+		}
+	}
+	p.requestQueue = nil
+	p.QueueLen = 0
+}
+
 // ProcessQueue dispatches queued requests while there is capacity.
 func (p *Proxy) ProcessQueue() int {
 	p.queueMu.Lock()
+
+	if p.shuttingDown.Load() {
+		p.queueMu.Unlock()
+		return 0
+	}
 
 	gate := p.gateLimit()
 
@@ -3659,13 +3683,50 @@ func (p *Proxy) ProcessQueue() int {
 		item := p.requestQueue[0]
 		p.requestQueue = p.requestQueue[1:]
 		p.QueueLen = len(p.requestQueue)
+
+		// Drop disconnected or already committed/aborted items silently.
+		if item.Req.Context().Err() != nil {
+			if tw, ok := item.Response.(*responseWriterTracker); ok && !tw.IsCommitted() {
+				if item.WriteError != nil {
+					item.WriteError(item.Response, http.StatusGatewayTimeout,
+						"queue timeout: client disconnected", "server_error", "queue_timeout")
+				}
+			}
+			continue
+		}
+		if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+			continue
+		}
+
 		p.ActiveRequests++
 		dispatched++
 
-		go p.dispatchQueuedItem(item)
+		go p.dispatchItem(&item)
 	}
 	p.queueMu.Unlock()
 	return dispatched
+}
+
+// triggerProcessQueue debounces ProcessQueue triggers from config changes.
+func (p *Proxy) triggerProcessQueue() {
+	p.pqTriggerMu.Lock()
+	defer p.pqTriggerMu.Unlock()
+	if p.pqTriggerTimer != nil {
+		p.pqTriggerTimer.Stop()
+	}
+	p.pqTriggerTimer = time.AfterFunc(100*time.Millisecond, func() {
+		p.ProcessQueue()
+	})
+}
+
+// stopProcessQueueTrigger stops any pending ProcessQueue trigger.
+func (p *Proxy) stopProcessQueueTrigger() {
+	p.pqTriggerMu.Lock()
+	defer p.pqTriggerMu.Unlock()
+	if p.pqTriggerTimer != nil {
+		p.pqTriggerTimer.Stop()
+		p.pqTriggerTimer = nil
+	}
 }
 
 // ResetQueue clears all queue state.
@@ -3965,6 +4026,8 @@ func (p *Proxy) FetchConcurrency(fresh bool) {
 	}
 	// A2: invalidate effective concurrency cache
 	p.effectiveConcurrencyCache = nil
+	// §6.4: invalidate cached gate limit
+	p.invalidateGateCache()
 	p.mu.Unlock()
 }
 
@@ -3973,36 +4036,48 @@ func (p *Proxy) FetchConcurrency(fresh bool) {
 // (or just override if apiHardCap is nil), overridden = true.
 // Otherwise uses API values directly, overridden = false.
 // Result is cached in effectiveConcurrencyCache (invalidated by FetchConcurrency).
+// Cache key includes Limit, HardCap, and OverrideConcurrency values.
 //
 // IMPORTANT: Cache is only used in production (p.Upstream != nil). In test mode
 // (p.Upstream == nil), test helpers like setLastConcurrency() modify
 // p.LastConcurrency directly without invalidating the cache, so we must
 // always recompute to avoid returning stale cached results.
 func (p *Proxy) GetEffectiveConcurrency(lastConcurrency ConcurrencyData) ConcurrencyData {
+	override := p.Config.OverrideConcurrency
+
 	// Check cache first (§6.3) — only in production mode
 	if p.Upstream != nil {
 		p.mu.RLock()
-		if p.effectiveConcurrencyCache != nil {
-			cached := *p.effectiveConcurrencyCache
-			p.mu.RUnlock()
-			return cached
+		cached := p.effectiveConcurrencyCache
+		if cached != nil {
+			// Compare cache key: Limit, HardCap, OverrideConcurrency
+			limitMatch := (lastConcurrency.Limit == nil && cached.Limit == nil) ||
+				(lastConcurrency.Limit != nil && cached.Limit != nil && *lastConcurrency.Limit == *cached.Limit)
+			hardCapMatch := (lastConcurrency.HardCap == nil && cached.HardCap == nil) ||
+				(lastConcurrency.HardCap != nil && cached.HardCap != nil && *lastConcurrency.HardCap == *cached.HardCap)
+			overrideMatch := cached.Overridden == (override > 0)
+			if limitMatch && hardCapMatch && overrideMatch {
+				result := *cached
+				p.mu.RUnlock()
+				return result
+			}
 		}
 		p.mu.RUnlock()
 	}
 
 	// Compute the result (existing logic)
 	result := lastConcurrency
-	if p.Config.OverrideConcurrency > 0 {
+	if override > 0 {
 		result.Overridden = true
 		if lastConcurrency.HardCap != nil {
-			min := p.Config.OverrideConcurrency
+			min := override
 			if *lastConcurrency.HardCap < min {
 				min = *lastConcurrency.HardCap
 			}
 			hc := min
 			result.HardCap = &hc
 		} else {
-			hc := p.Config.OverrideConcurrency
+			hc := override
 			result.HardCap = &hc
 		}
 	}
@@ -4051,9 +4126,17 @@ func (p *Proxy) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		uptimeSec = int(time.Since(p.StartedAt).Seconds())
 	}
 
-	// api_key_valid — calls ValidateApiKey() which implements the
-	// 5-min cache refresh per spec. Also refreshes user info as a side effect.
-	apiKeyValid := p.ValidateApiKey()
+	// api_key_valid — use cached validation status when available.
+	apiKeyValid := false
+	p.mu.RLock()
+	if p.UserInfoCache != nil && p.UserInfoCache.data != nil &&
+		time.Since(p.UserInfoCache.fetchedAt) < UserInfoCacheTTL {
+		apiKeyValid = true
+	}
+	p.mu.RUnlock()
+	if !apiKeyValid && p.Upstream != nil {
+		apiKeyValid = p.ValidateApiKey()
+	}
 
 	// token_state, valid_tokens, total_tokens (KeyPool may be nil in tests)
 	// Initialize as empty slice so nil KeyPool marshals to [] not null (SPEC §22)
@@ -4110,9 +4193,13 @@ func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	models := p.GetEffectiveModels()
+	p.catalogMu.RLock()
+	modelInfo := p.ModelInfoMap
+	displayNames := p.DisplayNameMap
+	p.catalogMu.RUnlock()
 	var data []map[string]interface{}
 	for _, m := range models {
-		info := p.ModelInfoMap[m]
+		info := modelInfo[m]
 		entry := map[string]interface{}{
 			"id":           m,
 			"object":       "model",
@@ -4120,7 +4207,7 @@ func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 			"owned_by":     "umans",
 			"root":         m,
 			"permission":   []interface{}{},
-			"display_name": p.DisplayNameMap[m],
+			"display_name": displayNames[m],
 		}
 		if cw, ok := toInt(info.Capabilities.ContextWindow); ok && cw > 0 {
 			entry["context_length"] = cw
@@ -4176,10 +4263,16 @@ func (p *Proxy) HandleApiModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	models := p.GetEffectiveModels()
+	p.configMu.RLock()
+	disabled := p.Config.DisabledModels
+	p.configMu.RUnlock()
+	p.catalogMu.RLock()
+	displayNames := p.DisplayNameMap
+	p.catalogMu.RUnlock()
 	WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"models":         models,
-		"disabledModels": p.DisabledModels,
-		"displayNames":   p.DisplayNameMap,
+		"disabledModels": disabled,
+		"displayNames":   displayNames,
 	})
 }
 
@@ -4189,13 +4282,28 @@ func (p *Proxy) HandleModelsInfo(w http.ResponseWriter, r *http.Request) {
 		WriteOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
-	WriteJSON(w, http.StatusOK, p.ModelInfoMap)
+	p.catalogMu.RLock()
+	modelInfo := p.ModelInfoMap
+	p.catalogMu.RUnlock()
+	WriteJSON(w, http.StatusOK, modelInfo)
 }
 
 // HandleChatCompletions is the entry point for /v1/chat/completions (§19).
 // It performs auth, body reading, JSON parsing, model extraction, and
 // dispatches through the concurrency queue to proxyChatRequest.
 func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	// §35.1: recover from panics
+	defer func() {
+		if rv := recover(); rv != nil {
+			log.Printf("PANIC in HandleChatCompletions: %v", rv)
+			if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+				return
+			}
+			WriteOpenAIError(w, http.StatusInternalServerError,
+				"internal server error", "server_error", "")
+		}
+	}()
+
 	if r.Method != http.MethodPost {
 		WriteOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
@@ -4241,20 +4349,10 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// §5.3: Try to dispatch immediately or enqueue
 	if p.TryEnqueueOrDispatch(&item) {
-		// Dispatched immediately — caller must manage ActiveRequests lifecycle
-		p.queueMu.Lock()
-		p.ActiveRequests++
-		p.queueMu.Unlock()
-
-		defer func() {
-			p.OnRequestComplete()
-		}()
-
-		p.proxyChatRequest(w, r, payload, model,
-			OpenAIErrorWriter(), OpenAIPassthroughErrorWriter())
+		return
 	}
 	// If TryEnqueueOrDispatch returned false, the request was either enqueued
-	// (will be dispatched later by ProcessQueue → dispatchQueuedItem, which
+	// (will be dispatched later by ProcessQueue → dispatchItem, which
 	// handles ActiveRequests increment/decrement) or rejected with a 503
 	// (WriteQueueFullError already called inside TryEnqueueOrDispatch).
 }
@@ -4264,6 +4362,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// §35.1: recover from panics
 	defer func() {
 		if rv := recover(); rv != nil {
+			log.Printf("PANIC in HandleMessages: %v", rv)
+			if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+				return
+			}
 			WriteAnthropicError(w, http.StatusInternalServerError,
 				"internal server error", "api_error")
 		}
@@ -4333,17 +4435,9 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Try to dispatch immediately or enqueue (§5)
 	dispatched := p.TryEnqueueOrDispatch(&item)
-	if !dispatched {
+	if dispatched {
 		return
 	}
-
-	// Direct dispatch: increment active requests, process, decrement on completion
-	p.queueMu.Lock()
-	p.ActiveRequests++
-	p.queueMu.Unlock()
-	defer p.OnRequestComplete()
-
-	p.proxyAnthropicRequest(item)
 }
 
 func (p *Proxy) HandleConfigGet(w http.ResponseWriter, r *http.Request) {
@@ -4427,6 +4521,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		switch v {
 		case "none", "bing", "wallhaven":
 			p.Config.WallpaperSource = v
+			p.invalidateDashboardCache()
 		default:
 			WriteJSON(w, http.StatusBadRequest, map[string]interface{}{
 				"error": "wallpaperSource must be one of: none, bing, wallhaven",
@@ -4501,8 +4596,10 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 			}
 			// Any mode change can change the gate, so always process the queue
 			// to dispatch waiting items or clear stale state.
-			go p.ProcessQueue()
+			p.triggerProcessQueue()
 		}
+		// §6.4: invalidate cached gate on concurrency mode change
+		p.invalidateGateCache()
 	}
 	if v, ok := data["manualConcurrencyLimit"].(float64); ok {
 		limit := int(v)
@@ -4511,7 +4608,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		}
 		p.Config.ManualConcurrencyLimit = limit
 		p.setManualLimit(limit)
-		go p.ProcessQueue()
+		// §6.4: invalidate cached gate on manual limit change
+		p.invalidateGateCache()
+		p.triggerProcessQueue()
 	}
 	if v, ok := data["slotFreeDelay"].(float64); ok {
 		delay := int(v)
@@ -4571,6 +4670,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		p.KeyPool = NewKeyPool(keys)
 	}
 	debouncedSaveConfig(*p.Config)
+	p.invalidateDashboardCache()
 
 	WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"success":                   true,
@@ -4847,12 +4947,7 @@ func (p *Proxy) HandleUser(w http.ResponseWriter, r *http.Request) {
 // time.AfterFunc(500ms) so the HTTP response is flushed to the client
 // before the server shuts down (§29.2, §35.2).
 func (p *Proxy) triggerRestart() {
-	if p.httpServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = p.httpServer.Shutdown(ctx) // graceful drain; ignore error (we're exiting anyway)
-	}
-	p.flushErrorLog() // §35.2: flush logs before exit
+	p.Shutdown()
 	if p.exitFn != nil {
 		p.exitFn(42)
 	} else {
@@ -4875,13 +4970,22 @@ func (p *Proxy) flushErrorLog() {
 }
 
 // Shutdown performs graceful shutdown (§35.2):
-// 1. Poll ActiveRequests (proxy-level) until it reaches 0 or a 5-second
-//    timeout elapses — drains in-flight proxied requests before closing
-//    the HTTP listener.
-// 2. Close the HTTP server with a 5-second drain timeout.
-// 3. Flush and close the error log file.
-// 4. Call exitFn(0) (or os.Exit(0) if exitFn is nil).
+// 1. Mark the proxy as shutting down and reject new queued requests.
+// 2. Stop any pending ProcessQueue trigger.
+// 3. Reject queued items with 503.
+// 4. Poll ActiveRequests until it reaches 0 or a 5-second timeout elapses.
+// 5. Close the HTTP server with a 5-second drain timeout.
+// 6. Flush and close the error log file.
+// 7. Call exitFn(0) (or os.Exit(0) if exitFn is nil).
 func (p *Proxy) Shutdown() {
+	p.shuttingDown.Store(true)
+	p.stopProcessQueueTrigger()
+
+	// Reject queued items under queueMu
+	p.queueMu.Lock()
+	p.rejectQueueLocked()
+	p.queueMu.Unlock()
+
 	// Proxy-level drain: poll ActiveRequests until 0 or 5-second timeout.
 	pollTimeout := time.After(5 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -5310,7 +5414,7 @@ func (p *Proxy) HandleWallhavenWallpaper(w http.ResponseWriter, r *http.Request)
 // PerformVisionHandoff replaces images with text descriptions from the handoff
 // model (SPEC §11.5). It accepts optional pre-collected image parts via variadic
 // to avoid re-scanning the payload when parts have already been collected.
-func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedModel string, apiKey string, preCollectedParts ...[]ImagePart) int {
+func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]interface{}, resolvedModel string, apiKey string, preCollectedParts ...[]ImagePart) int {
 	if !p.NeedsVisionHandoff(resolvedModel) {
 		return 0
 	}
@@ -5331,17 +5435,30 @@ func (p *Proxy) PerformVisionHandoff(payload map[string]interface{}, resolvedMod
 		handoffModel = "umans-coder"
 	}
 
+	limit := p.Config.VisionHandoffConcurrency
+	if limit <= 0 {
+		limit = 4
+	}
+	sem := make(chan struct{}, limit)
+
 	descriptions := make([]string, len(parts))
 	var wg sync.WaitGroup
 	for i := range parts {
 		wg.Add(1)
 		go func(idx int, dataURI string) {
 			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				descriptions[idx] = "[Image analysis cancelled]"
+				return
+			}
+			defer func() { <-sem }()
 			if p.Upstream == nil {
 				descriptions[idx] = p.HandoffResponse
 				return
 			}
-			descriptions[idx] = p.analyzeImageViaHandoff(dataURI, handoffModel, apiKey)
+			descriptions[idx] = p.analyzeImageViaHandoff(ctx, dataURI, handoffModel, apiKey)
 		}(i, parts[i].DataURI)
 	}
 	wg.Wait()
@@ -5434,6 +5551,14 @@ func (p *Proxy) renderDashboardJS() []byte {
 	return p.dashJsRendered
 }
 
+// invalidateDashboardCache clears cached dashboard render outputs.
+func (p *Proxy) invalidateDashboardCache() {
+	p.dashMu.Lock()
+	p.dashRendered = nil
+	p.dashJsRendered = nil
+	p.dashMu.Unlock()
+}
+
 // ServeHTTP implements http.Handler for the Proxy. It wraps HandleRequest
 // with panic recovery (§35.1) and per-request timeout enforcement (§35.3).
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -5502,6 +5627,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tw.mu.Lock()
 		alreadyWritten := tw.written
 		if !alreadyWritten {
+			// Mark aborted so any concurrent writer (including queued dispatch
+			// that starts after this point) becomes a no-op.
+			tw.aborted = true
 			tw.hijacked = true
 		}
 		tw.mu.Unlock()
@@ -5532,6 +5660,12 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case path == "/" || path == "/dashboard":
+		// Snapshot wallpaper source under configMu.RLock to avoid reading a
+		// partially-updated value while HandleConfigPost is mutating Config.
+		p.configMu.RLock()
+		wallpaperSource := p.Config.WallpaperSource
+		p.configMu.RUnlock()
+
 		html := p.renderDashboard()
 		if html == nil {
 			w.WriteHeader(http.StatusNotFound)
@@ -5540,16 +5674,38 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 		// Determine wallpaper style and build injection CSS
 		var inject string
-		switch p.Config.WallpaperSource {
+		p.wallpaperCssMu.RLock()
+		cachedCss := p.wallpaperCss
+		cachedMod := p.wallpaperCssMod
+		cachedSrc := p.wallpaperCssSrc
+		p.wallpaperCssMu.RUnlock()
+
+		switch wallpaperSource {
 		case "bing", "wallhaven":
 			wpPath := ".cache/wallpaper.jpg"
-			if p.Config.WallpaperSource == "wallhaven" {
+			if wallpaperSource == "wallhaven" {
 				wpPath = ".cache/wallpaper-haven.jpg"
 			}
-			if data, err := os.ReadFile(wpPath); err == nil {
-				b64 := base64.StdEncoding.EncodeToString(data)
-				ct := imageContentType(data)
-				inject = fmt.Sprintf(`<style>body{background-image:url('data:%s;base64,%s')!important;background-size:cover!important;background-position:center!important;background-repeat:no-repeat!important;background-attachment:fixed!important;background-color:#070912}</style>`, ct, b64)
+			info, err := os.Stat(wpPath)
+			if err == nil {
+				mod := info.ModTime()
+				if cachedCss != "" && cachedSrc == wallpaperSource && cachedMod.Equal(mod) {
+					inject = cachedCss
+				} else {
+					data, err := os.ReadFile(wpPath)
+					if err == nil {
+						b64 := base64.StdEncoding.EncodeToString(data)
+						ct := imageContentType(data)
+						inject = fmt.Sprintf(`<style>body{background-image:url('data:%s;base64,%s')!important;background-size:cover!important;background-position:center!important;background-repeat:no-repeat!important;background-attachment:fixed!important;background-color:#070912}</style>`, ct, b64)
+						p.wallpaperCssMu.Lock()
+						p.wallpaperCss = inject
+						p.wallpaperCssMod = mod
+						p.wallpaperCssSrc = wallpaperSource
+						p.wallpaperCssMu.Unlock()
+					} else {
+						inject = `<style>body{background:#0d1117}</style>`
+					}
+				}
 			} else {
 				// No cached wallpaper file → fall back to dark background
 				inject = `<style>body{background:#0d1117}</style>`

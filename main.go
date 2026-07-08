@@ -21,7 +21,7 @@ const (
 	portRetryDelay    = 2 * time.Second
 	maxPortIncrements = 10
 
-	Version = "1.2.2"
+	Version = "1.2.3"
 )
 
 func main() {
@@ -54,7 +54,7 @@ func main() {
 	// Step 4: Create http.Server with timeouts
 	server := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", host, port),
-		Handler:           http.HandlerFunc(p.HandleRequest),
+		Handler:           p,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       0,
 		WriteTimeout:      0,

@@ -137,9 +137,31 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - **`headersCommitted` flag** — both OpenAI and Anthropic retry loops track whether response headers have been written to the client. Once committed, the retry callback returns an error instead of attempting to write again. Prevents "superfluous response.WriteHeader" panics when a mid-stream pipe break triggers a retry.
 - **`safeFlush(w)`** — central helper that wraps `flusher.Flush()` with `defer func() { recover() }()`. All flush calls in the codebase go through this helper (or through `responseWriterTracker.Flush` which has its own hijack guard). No bare `flusher.Flush()` calls remain.
 - **`writeSSEErrorEvent`** — panic-safe: wrapped in `defer func() { recover() }()` so writing an error event to a dead/hijacked connection is silently swallowed.
-- **`writeSSEHeaders`** — idempotent: if `Content-Type: text/event-stream` is already set, returns without calling `WriteHeader` again.
+- **`writeSSEHeaders`** — delegates to `responseWriterTracker.commitSSE()` when the writer is a tracker, making header commitment atomic under the tracker lock and guarded against `written`/`hijacked`/`aborted`.
+- **`responseWriterTracker`** — wraps the real `ResponseWriter` with `written`/`hijacked`/`aborted` tracking and implements `http.Hijacker`. `WriteHeader`/`Write`/`Flush` return early if the response is hijacked, written, or aborted. Used by the timeout middleware (`ServeHTTP`) to safely take over the response when a request times out.
 - **Retry callback panic recovery** — both OpenAI and Anthropic retry callbacks use named return values (`retry bool, err error`) with a `defer` recovery that logs the panic with `attempt`, `isLast`, and `headersCommitted` state, then returns the error to the retry loop.
-- **`responseWriterTracker`** — wraps the real `ResponseWriter` with `hijacked`/`written` tracking. `WriteHeader` returns early if hijacked. `Write` returns an error if hijacked. `Flush` returns early if hijacked. Used by the timeout middleware (`ServeHTTP`) to safely take over the response when a request times out mid-stream.
+
+### Request Lifecycle & Queueing
+- **`ServeHTTP`** — wraps every request in a `responseWriterTracker`, enforces `REQUEST_TIMEOUT` for the pre-streaming phase, and supports request abort on timeout. Streaming responses continue after timeout.
+- **`dispatchItem(item *QueueItem)`** — single dispatch path used for both direct dispatch and queued dispatch. Increments `ActiveRequests`, runs `defer OnRequestComplete()` exactly once, and guards against aborted/committed responses.
+- **`TryEnqueueOrDispatch(item)`** — owns `ActiveRequests` increment for direct dispatch and rejects new requests during shutdown.
+- **`ProcessQueue()`** — dispatches queued items while capacity exists, drops items whose client context was cancelled or response was aborted, and early-returns when shutting down.
+- **`OnRequestComplete()`** — decrements `ActiveRequests` (after optional `SlotFreeDelay`) and triggers `ProcessQueue()`.
+- **`Shutdown()`** — sets shutdown flag, rejects queued requests with 503, drains active requests, then exits.
+
+### Context Propagation
+- **`UpstreamClient.ChatCompletions(ctx, ...)`**, **`Messages(ctx, ...)`**, **`doPost(ctx, ...)`** — accept a caller-supplied context so client disconnects/timeouts cancel in-flight upstream work.
+- **Streaming requests** use the original client context once headers are committed, so long SSE streams are not truncated by the request timeout.
+
+### Vision Handoff
+- **`PerformVisionHandoff`** — parallel image analysis with a configurable concurrency cap (`VisionHandoffConcurrency`, default 4) to prevent goroutine explosion.
+- **`analyzeImageViaHandoff(ctx, ...)`** — accepts a context for cancellation propagation.
+
+### Catalog & Concurrency Caching
+- **Catalog singleflight** — custom singleflight group prevents thundering-herd `/models/info` fetches; stale cache is returned with `nil` error when upstream fails.
+- **Shared `catalogClient`** — reused `http.Client` for catalog/models/user-info fetches with keep-alive.
+- **`gateLimit()` cache** — 1-second TTL cache to reduce lock churn under load.
+- **Effective-concurrency cache** — keyed on `Limit`/`HardCap`/`OverrideConcurrency` to avoid recomputation per queue operation.
 
 ### API Key Thread Safety
 - **No shared mutable `apiKey` field on `UpstreamClient`** — the API key is passed as an explicit parameter to `ChatCompletions`, `Messages`, `doPost`, `GetUsage`, and `GetUserInfo`. This eliminates the data race that occurred when multiple goroutines called `SetAPIKey` concurrently on the shared `p.Upstream` instance.

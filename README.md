@@ -78,6 +78,15 @@ umans-dash-go/
   - `/v1/models/info` endpoint exposing the raw upstream model catalog
   - UHD Bing wallpaper (3840px peapix resolution upgrade)
   - Wallhaven resolution filter (`atleast=2560x1440`) with JPEG/PNG/WebP content-type detection
+  - Queue-full responses return HTTP 429 Too Many Requests with `Retry-After` header to discourage immediate retries
+  - Response-writer tracker with abort/hijack guards prevents superfluous `WriteHeader` panics and protects streaming responses from timeout middleware races
+  - Unified dispatch path for direct and queued requests with single lifecycle accounting
+  - Request-context propagation through upstream calls so client disconnects cancel in-flight work
+  - Configurable vision-handoff concurrency cap (default 4) to prevent goroutine explosion on multi-image requests
+  - Shared `catalogClient` for upstream catalog/models/user-info fetches with connection reuse
+  - Catalog singleflight with stale fallback to prevent thundering-herd refreshes
+  - Effective-concurrency cache and gate-limit cache to reduce lock churn under load
+  - Shutdown queue draining: rejects queued requests with 503 before draining active requests
   - Redesigned dashboard UI (unified refresh cycle, concurrency card with burst-zone visualization, sortable usage history with per-model drill-down)
 - **Shared features** (present in both, no behavioral difference documented):
   - `DISABLED_MODELS` config field, tool schema normalization, thinking payload normalization, reasoning-level adaptive thinking injection

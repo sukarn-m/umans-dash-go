@@ -10,10 +10,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +53,7 @@ type Config struct {
 	VisionHandoffPrompt     string            `json:"VISION_HANDOFF_PROMPT"`
 	VisionHandoffCacheEnabled bool           `json:"VISION_HANDOFF_CACHE_ENABLED"`
 	VisionHandoffCacheTtl   Duration          `json:"VISION_HANDOFF_CACHE_TTL"`
+	VisionHandoffConcurrency int              `json:"VISION_HANDOFF_CONCURRENCY"`
 	WallpaperSource         string            `json:"wallpaperSource"`
 	ApiKeyMode              string            `json:"API_KEY_MODE"` // "smart" (default), "managed", or "passthrough"
 	// ConcurrencyLimitMode controls which cap gates concurrency:
@@ -427,6 +430,43 @@ type userInfoCacheEntry struct {
 	fetchedAt time.Time
 }
 
+// Catalog singleflight group. Defined as a small local type to avoid external
+// dependencies (stdlib-only requirement).
+type catalogSingleflight struct {
+	mu    sync.Mutex
+	calls map[string]*catalogCall
+}
+
+type catalogCall struct {
+	wg  sync.WaitGroup
+	val interface{}
+	err error
+}
+
+func (sf *catalogSingleflight) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	sf.mu.Lock()
+	if sf.calls == nil {
+		sf.calls = make(map[string]*catalogCall)
+	}
+	if c, ok := sf.calls[key]; ok {
+		sf.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err
+	}
+	c := &catalogCall{}
+	c.wg.Add(1)
+	sf.calls[key] = c
+	sf.mu.Unlock()
+
+	c.val, c.err = fn()
+
+	c.wg.Done()
+	sf.mu.Lock()
+	delete(sf.calls, key)
+	sf.mu.Unlock()
+	return c.val, c.err
+}
+
 // Proxy is the central state holder for the proxy.
 // During implementation, all state (config, key pool, cache, model catalog, etc.)
 // will live as fields on this struct.
@@ -444,7 +484,6 @@ type Proxy struct {
 	dashJsRendered  []byte // cached rendered JS
 	ModelInfoMap    map[string]ModelInfo
 	DisplayNameMap  map[string]string
-	DisabledModels  []string
 	UpstreamPricing   map[string]Pricing
 	HandoffResponse  string
 
@@ -475,8 +514,7 @@ type Proxy struct {
 	// Config read/write lock (§25)
 	configMu            sync.RWMutex
 	CatalogCache        *catalogCache
-	CatalogFetching     bool
-	CatalogFetchDone    chan struct{}
+	catalogGroup        catalogSingleflight
 	UpstreamModelsCache *upstreamModelsCacheEntry
 	UserInfoCache       *userInfoCacheEntry
 
@@ -519,6 +557,27 @@ type Proxy struct {
 	retryConfigMu   sync.RWMutex
 	retryAttempts   int
 	backoffStrategy string
+
+	// §5.1 graceful shutdown/restart
+	shuttingDown atomic.Bool
+
+	// §3 ProcessQueue trigger debounce
+	pqTriggerMu    sync.Mutex
+	pqTriggerTimer *time.Timer
+
+	// §6.4 cached gate limit
+	cachedGate      int
+	cachedGateAt    time.Time
+	cachedGateMu    sync.RWMutex
+
+	// §7.3 wallpaper CSS cache
+	wallpaperCssMu  sync.RWMutex
+	wallpaperCss    string
+	wallpaperCssMod time.Time
+	wallpaperCssSrc string
+
+	// §7.6 shared HTTP client for catalog/models/user-info fetches
+	catalogClient *http.Client
 }
 
 // responseWriterTracker wraps an http.ResponseWriter to track whether
@@ -528,15 +587,16 @@ type Proxy struct {
 type responseWriterTracker struct {
 	http.ResponseWriter
 	mu         sync.Mutex
-	written    bool // true once WriteHeader or Write is called
-	hijacked   bool // true after middleware takes over the response
+	written    bool            // true once WriteHeader or Write is called
+	hijacked   bool            // true after middleware takes over the response
+	aborted    bool            // set by timeout middleware; writer methods become no-ops
 	clientCtx  context.Context // original client context (not the timeout-wrapped one)
 }
 
 func (rw *responseWriterTracker) WriteHeader(code int) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	if rw.hijacked || rw.written {
+	if rw.hijacked || rw.written || rw.aborted {
 		return
 	}
 	rw.written = true
@@ -545,27 +605,77 @@ func (rw *responseWriterTracker) WriteHeader(code int) {
 
 func (rw *responseWriterTracker) Write(b []byte) (int, error) {
 	rw.mu.Lock()
-	if rw.hijacked {
+	if rw.hijacked || rw.aborted {
 		rw.mu.Unlock()
-		return 0, fmt.Errorf("response writer hijacked by middleware")
+		return 0, http.ErrHijacked
 	}
 	rw.written = true
 	rw.mu.Unlock()
 	return rw.ResponseWriter.Write(b)
 }
 
+var _ http.Hijacker = (*responseWriterTracker)(nil)
+var _ http.Flusher = (*responseWriterTracker)(nil)
+
+// Hijack records that the connection has been hijacked and delegates to the
+// underlying ResponseWriter if it supports http.Hijacker.
+func (rw *responseWriterTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	rw.mu.Lock()
+	rw.hijacked = true
+	rw.mu.Unlock()
+	if hj, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("response writer does not support hijacking")
+}
+
+// IsCommitted reports whether the response has already been written, hijacked,
+// or aborted. It is safe for concurrent use.
+func (rw *responseWriterTracker) IsCommitted() bool {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.written || rw.hijacked || rw.aborted
+}
+
+// Abort marks the response as aborted. Subsequent WriteHeader/Write calls
+// become no-ops. This is used by the timeout middleware to signal that it has
+// taken over the response.
+func (rw *responseWriterTracker) Abort() {
+	rw.mu.Lock()
+	rw.aborted = true
+	rw.mu.Unlock()
+}
+
 // Flush is hijack-aware so that SSE error events aren't written after the
 // timeout middleware has taken over the response.
 func (rw *responseWriterTracker) Flush() {
 	rw.mu.Lock()
-	hijacked := rw.hijacked
-	rw.mu.Unlock()
-	if hijacked {
+	if rw.aborted || rw.hijacked {
+		rw.mu.Unlock()
 		return
 	}
+	rw.mu.Unlock()
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// commitSSE attempts to commit the SSE headers on this tracker. It returns
+// true if the headers were committed by this call, or false if the response
+// was already written, hijacked, or aborted.
+func (rw *responseWriterTracker) commitSSE() bool {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.written || rw.hijacked || rw.aborted {
+		return false
+	}
+	rw.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+	rw.ResponseWriter.Header().Set("Cache-Control", "no-cache")
+	rw.ResponseWriter.Header().Set("Connection", "keep-alive")
+	rw.ResponseWriter.Header().Set("X-Accel-Buffering", "no")
+	rw.written = true
+	rw.ResponseWriter.WriteHeader(http.StatusOK)
+	return true
 }
 
 // UpstreamClient is the HTTP client for communicating with the upstream UMANS API.
