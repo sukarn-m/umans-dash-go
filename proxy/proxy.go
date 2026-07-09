@@ -103,6 +103,17 @@ func NewProxy(cfg *Config) *Proxy {
 		UpstreamPricing: map[string]Pricing{},
 	}
 	p.StartedAt = time.Now()
+
+	// Initialize queue worker infrastructure.
+	p.queueDone = make(chan struct{})
+	p.queueCond = sync.NewCond(&p.queueMu)
+	p.workerWG.Add(1)
+	go p.queueWorker()
+
+	// Vision-handoff semaphore replaces the per-call local semaphore.
+	if n := p.getVisionHandoffLimit(); n > 0 {
+		p.visionHandoffSem = make(chan struct{}, n)
+	}
 	if err := p.InitErrorLogFile(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize error log file: %v\n", err)
 	}
@@ -264,6 +275,7 @@ func DefaultConfig() Config {
 		VisionHandoffConcurrency: 4,
 		WallpaperSource:        "bing",
 		ConcurrencyLimitMode:  "soft",
+		SlotFreeDelay:          2,
 		RetryAttempts:         &defRetry,
 		BackoffStrategy:       "aggressive",
 	}
@@ -443,12 +455,25 @@ func (u *UpstreamClient) SetAPIKey(key string) {
 }
 
 // SetTimeout updates the request timeout for subsequent requests.
-// Also updates the transport's ResponseHeaderTimeout to match.
+// Also updates the transport's ResponseHeaderTimeout and TLSClientConfig to match.
+// The goal is to avoid per-request http.Client/http.Transport allocation;
+// the existing transport is mutated in place.
 func (u *UpstreamClient) SetTimeout(timeout time.Duration) {
 	u.timeout = timeout
 	u.httpClient.Timeout = timeout
 	if tr, ok := u.httpClient.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = timeout
+		if tr.TLSClientConfig != nil {
+			// No TLS config changes needed for timeout; just ensure it persists.
+		}
+	}
+}
+
+// CloseIdleConnections closes idle connections on the underlying transport.
+// Called after SetTimeout to force new connections with updated timeouts.
+func (u *UpstreamClient) CloseIdleConnections() {
+	if tr, ok := u.httpClient.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
 	}
 }
 
@@ -2445,6 +2470,13 @@ func WriteJSON(w http.ResponseWriter, status int, payload interface{}) {
 		w.Write(errResp)
 		return
 	}
+	// 6.4: If the writer is a *responseWriterTracker and IsCommitted() returns
+	// true, skip WriteHeader and Write entirely instead of relying on the
+	// tracker's silent no-op. This prevents "superfluous response.WriteHeader"
+	// log warnings.
+	if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(b)
@@ -2461,7 +2493,20 @@ func readBodyText(body io.ReadCloser) (string, error) {
 	if len(data) > MaxBodySize {
 		return "", fmt.Errorf("upstream response body exceeds MaxBodySize (%d bytes)", MaxBodySize)
 	}
+	// 5.2: Drain any remaining body data before closing for connection reuse.
+	io.Copy(io.Discard, body)
+	body.Close()
 	return string(data), nil
+}
+
+// drainAndClose reads and discards any remaining body data before closing,
+// enabling HTTP connection reuse. Safe to call on an already-closed body.
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	io.Copy(io.Discard, body)
+	body.Close()
 }
 
 // pipeBodyToResponse copies the upstream response body to the client,
@@ -2553,6 +2598,19 @@ func safeFlush(w http.ResponseWriter) {
 // to a closed/hijacked connection) and silently swallows the error.
 func writeSSEErrorEvent(w http.ResponseWriter, errType, message string) {
 	defer func() { recover() }()
+	// 4.5: Skip writing the SSE error if the response writer has been hijacked
+	// or Abort() has already been called. Do NOT skip merely because headers
+	// have been committed; SSE error events are expected on an already-committed
+	// stream.
+	if tw, ok := w.(*responseWriterTracker); ok {
+		tw.mu.Lock()
+		hijacked := tw.hijacked
+		aborted := tw.aborted
+		tw.mu.Unlock()
+		if hijacked || aborted {
+			return
+		}
+	}
 	errJSON, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
 			"type":    errType,
@@ -2852,7 +2910,11 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 	// Step 8: Auto-Think (§19.8, §13.7)
 	// ═══════════════════════════════════════════════════════════════════════
 
-	if info, ok := p.ModelInfoMap[resolvedModel]; ok {
+	// 6.2: Guard catalog map reads under catalogMu.RLock()
+	p.catalogMu.RLock()
+	info, ok := p.ModelInfoMap[resolvedModel]
+	p.catalogMu.RUnlock()
+	if ok {
 		ApplyAutoThink(payload, info.Capabilities.Reasoning)
 	}
 
@@ -3115,7 +3177,7 @@ func (p *Proxy) proxyChatRequest(w http.ResponseWriter, r *http.Request,
 }
 
 // proxyAnthropicRequest handles an Anthropic-format messages request (§20).
-func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
+func (p *Proxy) proxyAnthropicRequest(item *QueueItem) {
 	// Snapshot config fields, then release lock (see proxyChatRequest for rationale).
 	p.configMu.RLock()
 	cfgMode := p.Config.ApiKeyMode
@@ -3286,7 +3348,7 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 
 		if resp.StatusCode >= 400 {
 			errBodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxBodySize))
-			resp.Body.Close()
+			drainAndClose(resp.Body)
 			errBody := string(errBodyBytes)
 
 			if IsRetryableStatus(resp.StatusCode) {
@@ -3330,6 +3392,10 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		headersCommitted = true
+		if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+			drainAndClose(resp.Body)
+			return false, nil
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, pipeErr := pipeBodyToResponse(resp.Body, w, r)
 		if pipeErr != nil && !errors.Is(pipeErr, io.EOF) {
@@ -3361,29 +3427,57 @@ func (p *Proxy) proxyAnthropicRequest(item QueueItem) {
 	return
 }
 
-// dispatchItem sends an item to the appropriate pipeline function.
-// proxyChatRequest/proxyAnthropicRequest are full implementations handling the
-// complete request lifecycle (key acquisition, normalization, retries, etc.).
-// The defer OnRequestComplete() ensures activeRequests is decremented exactly
-// once per dispatched item.
-func (p *Proxy) dispatchItem(item *QueueItem) {
+// dispatchItem is used only for the no-limit fast path in TryEnqueueOrDispatch.
+// It reserves a slot synchronously and spawns runDispatch.
+// dispatchItem does NOT call OnRequestComplete() itself — that is exclusively
+// in runDispatch's defer.
+func (p *Proxy) dispatchItem(item *QueueItem) bool {
+	p.queueMu.Lock()
+
+	if p.shuttingDown.Load() {
+		p.queueMu.Unlock()
+		return false
+	}
+	if err := item.Req.Context().Err(); err != nil {
+		p.queueMu.Unlock()
+		return false
+	}
+	if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+		p.queueMu.Unlock()
+		return false
+	}
+
+	p.ActiveRequests++
+	p.queueMu.Unlock()
+
+	go p.runDispatch(item)
+	return true
+}
+
+// runDispatch executes a request that already owns a slot. It does not re-check
+// the gate or modify ActiveRequests; it only runs the proxy handler and calls
+// OnRequestComplete() in every exit path via defer.
+func (p *Proxy) runDispatch(item *QueueItem) {
+	if item.Done != nil {
+		defer close(item.Done)
+	}
 	defer func() {
 		if rv := recover(); rv != nil {
 			stack := make([]byte, 4096)
 			n := runtime.Stack(stack, false)
-			log.Printf("PANIC recovered in dispatchItem: %v\n%s", rv, stack[:n])
+			log.Printf("panic in runDispatch: %v\n%s", rv, stack[:n])
+			if tw, ok := item.Response.(*responseWriterTracker); ok && !tw.IsCommitted() {
+				if item.WriteError != nil {
+					item.WriteError(item.Response, http.StatusInternalServerError,
+						"internal error", "server_error", "panic")
+				}
+			}
 		}
 		p.OnRequestComplete()
 	}()
 
-	// Lightweight guard: if the response became committed/aborted after the slot
-	// was reserved, the slot will still be released by the defer above.
-	if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
-		return
-	}
-
 	if item.Format == "anthropic" {
-		p.proxyAnthropicRequest(*item)
+		p.proxyAnthropicRequest(item)
 	} else {
 		p.proxyChatRequest(item.Response, item.Req, item.Payload, item.Model,
 			item.WriteError, item.WritePassthroughError)
@@ -3403,12 +3497,17 @@ func (p *Proxy) gateLimit() int {
 		return gate
 	}
 
-	eff := p.GetEffectiveConcurrency(p.LastConcurrency)
+	// Snapshot OverrideConcurrency under configMu.RLock and manualLimit/mode
+	// via existing thread-safe helpers.
+	p.configMu.RLock()
+	override := p.Config.OverrideConcurrency
+	lastConcurrency := p.LastConcurrency
+	p.configMu.RUnlock()
 
-	p.concurrencyLimitMu.RLock()
-	mode := p.concurrencyLimitMode
-	manualLimit := p.manualLimit
-	p.concurrencyLimitMu.RUnlock()
+	eff := p.GetEffectiveConcurrency(lastConcurrency, override)
+
+	mode := p.getConcurrencyLimitMode()
+	manualLimit := p.getManualLimit()
 
 	var gate int
 	switch mode {
@@ -3534,71 +3633,108 @@ func (p *Proxy) setRetryConfig(attempts int, strategy string) {
 	p.retryConfigMu.Unlock()
 }
 
+// getVisionHandoffLimit reads Config.VisionHandoffConcurrency under configMu.RLock.
+func (p *Proxy) getVisionHandoffLimit() int {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
+	return p.Config.VisionHandoffConcurrency
+}
+
+// trySignalQueueLocked schedules one ProcessQueue pass. Caller must hold queueMu (write).
+func (p *Proxy) trySignalQueueLocked() {
+	if p.queuePending || p.shuttingDown.Load() {
+		return
+	}
+	p.queuePending = true
+	p.queueCond.Signal()
+}
+
+// signalQueue schedules one ProcessQueue pass.
+func (p *Proxy) signalQueue() {
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
+	p.trySignalQueueLocked()
+}
+
+// queueWorker runs in a background goroutine and processes the queue when signaled.
+func (p *Proxy) queueWorker() {
+	defer p.workerWG.Done()
+	for {
+		p.queueMu.Lock()
+		for !p.queuePending && !p.shuttingDown.Load() {
+			p.queueCond.Wait()
+		}
+		if p.shuttingDown.Load() {
+			p.queuePending = false
+			p.queueMu.Unlock()
+			return
+		}
+		p.queuePending = false
+		p.queueMu.Unlock()
+		p.ProcessQueue()
+	}
+}
+
 // TryEnqueueOrDispatch attempts to dispatch a request immediately if under the
-// concurrency gate, or enqueues it if capacity exists.
+// TryEnqueueOrDispatch attempts to dispatch a request immediately if there is no
+// concurrency gate, or enqueues it for the queue worker to dispatch when a gate
+// is in effect.
 //
 // Contract:
 //   - Returns true if the request was dispatched directly. ActiveRequests is
-//     already incremented; OnRequestComplete() is called by dispatchItem.
+//     already incremented; OnRequestComplete() is called by runDispatch.
 //   - Returns false if the request was enqueued or rejected. The caller must
 //     NOT call OnRequestComplete() in this case.
 func (p *Proxy) TryEnqueueOrDispatch(item *QueueItem) bool {
-	p.queueMu.Lock()
-
 	if p.shuttingDown.Load() {
-		p.queueMu.Unlock()
-		if item != nil && item.WriteError != nil && item.Response != nil {
+		if item.WriteError != nil {
 			item.WriteError(item.Response, http.StatusServiceUnavailable,
-				"server is shutting down", "server_error", "shutting_down")
+				"service unavailable", "server_error", "shutting_down")
+		}
+		if item.Done != nil {
+			close(item.Done)
 		}
 		return false
 	}
 
+	p.queueMu.Lock()
 	gate := p.gateLimit()
 
-	// No gate → dispatch immediately
+	// No gate → dispatch immediately (queue is drained in ProcessQueue).
 	if gate < 0 {
-		p.ActiveRequests++
 		p.queueMu.Unlock()
-		p.dispatchItem(item)
-		return true
-	}
-
-	// Under gate → dispatch immediately
-	if p.ActiveRequests < gate {
-		p.ActiveRequests++
-		p.queueMu.Unlock()
-		// Guard: if the client already disconnected/committed, release the slot.
-		if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
-			p.OnRequestComplete()
+		if p.dispatchItem(item) {
 			return true
 		}
-		p.dispatchItem(item)
-		return true
-	}
-
-	// At or over gate → try to enqueue
-	if len(p.requestQueue) >= MaxQueueSize {
-		// Queue full → reject with 503
-		p.ThrottledCount++
-		p.queueMu.Unlock()
-		if item != nil && item.WriteError != nil && item.Response != nil {
-			WriteQueueFullError(item.Response, item.Format)
+		// dispatchItem returned false: shutdown, cancelled, or committed.
+		// Do NOT re-enqueue; the item was not consumed.
+		if item.Done != nil {
+			close(item.Done)
 		}
 		return false
 	}
 
-	// Enqueue
-	p.requestQueue = append(p.requestQueue, *item)
+	if len(p.requestQueue) >= MaxQueueSize {
+		p.ThrottledCount++
+		p.queueMu.Unlock()
+		WriteQueueFullError(item.Response, item.Format)
+		if item.Done != nil {
+			close(item.Done)
+		}
+		return false
+	}
+
+	p.requestQueue = append(p.requestQueue, item)
 	p.QueueLen = len(p.requestQueue)
+	p.trySignalQueueLocked()
 	p.queueMu.Unlock()
 	return false
 }
 
 // GetQueueLength returns the current queue length in a thread-safe manner.
 func (p *Proxy) GetQueueLength() int {
-	p.queueMu.Lock()
-	defer p.queueMu.Unlock()
+	p.queueMu.RLock()
+	defer p.queueMu.RUnlock()
 	return len(p.requestQueue)
 }
 
@@ -3631,19 +3767,35 @@ func (p *Proxy) getSlotFreeDelay() int {
 	return p.Config.SlotFreeDelay
 }
 
-// OnRequestComplete decrements the active request count and processes the queue.
-// If SlotFreeDelay > 0, it sleeps that many seconds before freeing the slot.
+// OnRequestComplete decrements the active request count and signals the queue.
+// If SlotFreeDelay > 0, it waits that many seconds before freeing the slot.
+// The delay goroutine listens on queueDone so shutdown can cancel pending delays.
 func (p *Proxy) OnRequestComplete() {
-	// Configurable delay before freeing the slot (avoids upstream rate limits).
-	if delay := p.getSlotFreeDelay(); delay > 0 {
-		time.Sleep(time.Duration(delay) * time.Second)
+	delay := p.getSlotFreeDelay()
+
+	if delay <= 0 || p.shuttingDown.Load() {
+		p.queueMu.Lock()
+		if p.ActiveRequests > 0 {
+			p.ActiveRequests--
+		}
+		p.queueMu.Unlock()
+		p.signalQueue()
+		return
 	}
-	p.queueMu.Lock()
-	if p.ActiveRequests > 0 {
-		p.ActiveRequests--
-	}
-	p.queueMu.Unlock()
-	p.ProcessQueue()
+
+	go func() {
+		select {
+		case <-time.After(time.Duration(delay) * time.Second):
+		case <-p.queueDone:
+			// Shutdown cancelled the delay; release immediately.
+		}
+		p.queueMu.Lock()
+		if p.ActiveRequests > 0 {
+			p.ActiveRequests--
+		}
+		p.queueMu.Unlock()
+		p.signalQueue()
+	}()
 }
 
 // rejectQueueLocked writes a 503 to every queued item and clears the queue.
@@ -3657,85 +3809,122 @@ func (p *Proxy) rejectQueueLocked() {
 			item.WriteError(item.Response, http.StatusServiceUnavailable,
 				"server is shutting down", "server_error", "shutting_down")
 		}
+		if item.Done != nil {
+			close(item.Done)
+		}
 	}
 	p.requestQueue = nil
 	p.QueueLen = 0
 }
 
 // ProcessQueue dispatches queued requests while there is capacity.
+// It is the only dispatcher when a concurrency limit is in effect.
+// It reserves slots under queueMu, removes the corresponding items from the
+// queue, then launches goroutines that already own their slots.
+//
+// If gateLimit() returns < 0 (no limit in effect), the queue is drained under
+// queueMu and all queued items are dispatched immediately. This prevents
+// already-queued items from being stranded when the limit is removed at runtime.
 func (p *Proxy) ProcessQueue() int {
+	if p.shuttingDown.Load() {
+		return 0
+	}
+
 	p.queueMu.Lock()
 
-	if p.shuttingDown.Load() {
-		p.queueMu.Unlock()
-		return 0
-	}
-
+	// If no limit is in effect, drain the entire queue immediately.
 	gate := p.gateLimit()
-
 	if gate < 0 {
+		if len(p.requestQueue) == 0 {
+			p.queueMu.Unlock()
+			return 0
+		}
+		toDispatch := make([]*QueueItem, len(p.requestQueue))
+		copy(toDispatch, p.requestQueue)
+		p.requestQueue = nil
+		p.QueueLen = 0
+		for range toDispatch {
+			p.ActiveRequests++
+		}
 		p.queueMu.Unlock()
-		return 0
+		for _, item := range toDispatch {
+			go p.runDispatch(item)
+		}
+		return len(toDispatch)
 	}
 
-	dispatched := 0
-	for len(p.requestQueue) > 0 && p.ActiveRequests < gate {
-		item := p.requestQueue[0]
-		p.requestQueue = p.requestQueue[1:]
-		p.QueueLen = len(p.requestQueue)
+	var toDispatch []*QueueItem
+	var cancelled []*QueueItem
 
-		// Drop disconnected or already committed/aborted items silently.
+	for i := 0; i < len(p.requestQueue); i++ {
+		// Re-check shutdown and gate inside the loop.
+		if p.shuttingDown.Load() {
+			break
+		}
+		currentGate := p.gateLimit()
+		if currentGate != gate {
+			// Gate changed; stop this pass and let the next signal re-evaluate.
+			break
+		}
+		if p.ActiveRequests >= currentGate {
+			// No free slots. The next completion will signal a new pass.
+			break
+		}
+
+		item := p.requestQueue[i]
 		if item.Req.Context().Err() != nil {
-			if tw, ok := item.Response.(*responseWriterTracker); ok && !tw.IsCommitted() {
-				if item.WriteError != nil {
-					item.WriteError(item.Response, http.StatusGatewayTimeout,
-						"queue timeout: client disconnected", "server_error", "queue_timeout")
-				}
-			}
-			continue
-		}
-		if tw, ok := item.Response.(*responseWriterTracker); ok && tw.IsCommitted() {
+			cancelled = append(cancelled, item)
 			continue
 		}
 
+		// Reserve the slot while holding queueMu.
 		p.ActiveRequests++
-		dispatched++
-
-		go p.dispatchItem(&item)
+		toDispatch = append(toDispatch, item)
 	}
+
+	// Remove dispatched/cancelled items from the head of the queue.
+	processed := len(toDispatch) + len(cancelled)
+	if processed > 0 {
+		p.requestQueue = p.requestQueue[processed:]
+	}
+	p.QueueLen = len(p.requestQueue)
 	p.queueMu.Unlock()
-	return dispatched
-}
 
-// triggerProcessQueue debounces ProcessQueue triggers from config changes.
-func (p *Proxy) triggerProcessQueue() {
-	p.pqTriggerMu.Lock()
-	defer p.pqTriggerMu.Unlock()
-	if p.pqTriggerTimer != nil {
-		p.pqTriggerTimer.Stop()
+	// Write cancellation errors outside queueMu.
+	for _, item := range cancelled {
+		if tw, ok := item.Response.(*responseWriterTracker); ok && !tw.IsCommitted() {
+			if item.WriteError != nil {
+				item.WriteError(item.Response, http.StatusGatewayTimeout,
+					"queue timeout: client disconnected", "server_error", "client_cancelled")
+			}
+		}
+		if item.Done != nil {
+			close(item.Done)
+		}
 	}
-	p.pqTriggerTimer = time.AfterFunc(100*time.Millisecond, func() {
-		p.ProcessQueue()
-	})
-}
 
-// stopProcessQueueTrigger stops any pending ProcessQueue trigger.
-func (p *Proxy) stopProcessQueueTrigger() {
-	p.pqTriggerMu.Lock()
-	defer p.pqTriggerMu.Unlock()
-	if p.pqTriggerTimer != nil {
-		p.pqTriggerTimer.Stop()
-		p.pqTriggerTimer = nil
+	// Dispatch reserved slots outside queueMu.
+	for _, item := range toDispatch {
+		go p.runDispatch(item)
 	}
+
+	if len(toDispatch) > 0 {
+		p.signalQueue()
+	}
+	return len(toDispatch)
 }
 
 // ResetQueue clears all queue state.
 func (p *Proxy) ResetQueue() {
 	p.queueMu.Lock()
 	defer p.queueMu.Unlock()
+
+	// ResetQueue clears queue accounting. It is only safe when there are no
+	// in-flight requests whose goroutines will later call OnRequestComplete().
+	// If called while requests are active, ActiveRequests accounting will diverge.
+	p.ActiveRequests = 0
 	p.requestQueue = nil
 	p.QueueLen = 0
-	p.ActiveRequests = 0
 	p.ThrottledCount = 0
 }
 
@@ -3810,24 +3999,22 @@ func (p *Proxy) FetchUsage(fresh bool) *UsageData {
 		newWindow = data.Window.StartedAt
 	}
 
-	// Step 1: Read old ThrottledWindow under p.mu.RLock (snapshot)
-	p.mu.RLock()
+	// Step 1: Read old ThrottledWindow under queueMu.RLock (snapshot)
+	// Both ThrottledWindow and ThrottledCount are co-located under queueMu.
+	p.queueMu.RLock()
 	oldWindow := p.ThrottledWindow
-	p.mu.RUnlock()
+	p.queueMu.RUnlock()
 
 	// Step 2: If window changed, reset ThrottledCount under queueMu.Lock()
-	// (ThrottledCount lives under queueMu, NOT p.mu)
 	if newWindow != "" && newWindow != oldWindow {
 		p.queueMu.Lock()
 		p.ThrottledCount = 0
+		p.ThrottledWindow = newWindow
 		p.queueMu.Unlock()
 	}
 
-	// Step 3: Write ThrottledWindow + cache fields under p.mu.Lock()
+	// Step 3: Write cache fields under p.mu.Lock()
 	p.mu.Lock()
-	if newWindow != "" && newWindow != oldWindow {
-		p.ThrottledWindow = newWindow
-	}
 	p.usageCache = data
 	p.usageCacheFetchedAt = time.Now()
 	p.UsageData = data
@@ -4042,9 +4229,11 @@ func (p *Proxy) FetchConcurrency(fresh bool) {
 // (p.Upstream == nil), test helpers like setLastConcurrency() modify
 // p.LastConcurrency directly without invalidating the cache, so we must
 // always recompute to avoid returning stale cached results.
-func (p *Proxy) GetEffectiveConcurrency(lastConcurrency ConcurrencyData) ConcurrencyData {
-	override := p.Config.OverrideConcurrency
-
+//
+// The override parameter is passed in by the caller (snapshot under configMu.RLock)
+// to avoid recursive configMu.RLock when called from gateLimit() and self-deadlock
+// when called from HandleConfigPost (which holds configMu.Lock()).
+func (p *Proxy) GetEffectiveConcurrency(lastConcurrency ConcurrencyData, override int) ConcurrencyData {
 	// Check cache first (§6.3) — only in production mode
 	if p.Upstream != nil {
 		p.mu.RLock()
@@ -4196,6 +4385,7 @@ func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 	p.catalogMu.RLock()
 	modelInfo := p.ModelInfoMap
 	displayNames := p.DisplayNameMap
+	upstreamPricing := p.UpstreamPricing
 	p.catalogMu.RUnlock()
 	var data []map[string]interface{}
 	for _, m := range models {
@@ -4219,7 +4409,7 @@ func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 			}
 			entry["max_output_tokens"] = outputLimit
 		}
-		if pr, ok := p.UpstreamPricing[m]; ok {
+		if pr, ok := upstreamPricing[m]; ok {
 			pricing := map[string]interface{}{}
 			if pr.Input > 0 {
 				pricing["prompt"] = pr.Input / 1000000.0
@@ -4267,7 +4457,11 @@ func (p *Proxy) HandleApiModels(w http.ResponseWriter, r *http.Request) {
 	disabled := p.Config.DisabledModels
 	p.configMu.RUnlock()
 	p.catalogMu.RLock()
-	displayNames := p.DisplayNameMap
+	// Deep copy displayNames to avoid racing with concurrent catalog updates.
+	displayNames := make(map[string]string, len(p.DisplayNameMap))
+	for k, v := range p.DisplayNameMap {
+		displayNames[k] = v
+	}
 	p.catalogMu.RUnlock()
 	WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"models":         models,
@@ -4283,9 +4477,13 @@ func (p *Proxy) HandleModelsInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.catalogMu.RLock()
-	modelInfo := p.ModelInfoMap
+	// Deep copy ModelInfoMap to avoid racing with concurrent catalog updates.
+	modelInfoCopy := make(map[string]ModelInfo, len(p.ModelInfoMap))
+	for k, v := range p.ModelInfoMap {
+		modelInfoCopy[k] = v // ModelInfo is a value type with interface{} fields — shallow copy is sufficient
+	}
 	p.catalogMu.RUnlock()
-	WriteJSON(w, http.StatusOK, modelInfo)
+	WriteJSON(w, http.StatusOK, modelInfoCopy)
 }
 
 // HandleChatCompletions is the entry point for /v1/chat/completions (§19).
@@ -4336,7 +4534,15 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Construct QueueItem for the concurrency queue
+	// Construct QueueItem for the concurrency queue.
+	// Detach the request context so the queue item survives ServeHTTP's
+	// return. The async queue dispatch may run after ServeHTTP returns and
+	// its defer cancel() fires, which would cancel the original context and
+	// cause every queued request to be rejected as "client disconnected".
+	// We keep the timeout deadline and propagate cancellation via the tracker's
+	// clientCtx for client-disconnect detection in pipeBodyToResponse.
+	done := make(chan struct{})
+	queueReq := r.WithContext(detachedContext(r.Context()))
 	item := QueueItem{
 		Format:                "openai",
 		Response:              w,
@@ -4344,17 +4550,33 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model:                 model,
 		WriteError:            OpenAIErrorWriter(),
 		WritePassthroughError: OpenAIPassthroughErrorWriter(),
-		Req:                   r,
+		Req:                   queueReq,
+		Done:                  done,
 	}
 
 	// §5.3: Try to dispatch immediately or enqueue
 	if p.TryEnqueueOrDispatch(&item) {
+		// Dispatched synchronously (no gate) — runDispatch runs in a goroutine.
+		// Wait for it to complete so ServeHTTP doesn't return (and finalize the
+		// response) before the request is done.
+		<-done
 		return
 	}
-	// If TryEnqueueOrDispatch returned false, the request was either enqueued
-	// (will be dispatched later by ProcessQueue → dispatchItem, which
-	// handles ActiveRequests increment/decrement) or rejected with a 503
-	// (WriteQueueFullError already called inside TryEnqueueOrDispatch).
+	// If TryEnqueueOrDispatch returned false, the request was enqueued.
+	// Wait for the queue worker to dispatch and complete it.
+	<-done
+}
+
+// detachedContext returns a context that is never cancelled and has no
+// deadline, but carries the values from the parent. This is used for queue
+// items whose dispatch may outlive the ServeHTTP call that created them.
+// Without this, the context derived from r.Context() is cancelled when
+// ServeHTTP returns (after the handler enqueues the item and returns),
+// causing every queued request to be rejected as "client disconnected" before
+// the queue worker can dispatch it. Client-disconnect detection for streaming
+// is handled separately via responseWriterTracker.clientCtx in pipeBodyToResponse.
+func detachedContext(parent context.Context) context.Context {
+	return context.WithoutCancel(parent)
 }
 
 // HandleMessages is the Anthropic Messages pipeline (§20).
@@ -4420,6 +4642,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Construct QueueItem
+	// Detach the request context so the queue item survives ServeHTTP's
+	// return (see HandleChatCompletions for rationale).
+	done := make(chan struct{})
+	queueReq := r.WithContext(detachedContext(r.Context()))
 	item := QueueItem{
 		Response:              w,
 		Payload:               payload,
@@ -4427,17 +4653,18 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		WriteError:            AnthropicErrorWriter(),
 		WritePassthroughError: AnthropicPassthroughErrorWriter(),
 		Format:                "anthropic",
-		Req:                   r,
+		Req:                   queueReq,
 		Fingerprint:           fp,
 		PreferredKeyIndex:     preferredIndex,
 		IsStream:              isStream,
+		Done:                  done,
 	}
 
 	// Try to dispatch immediately or enqueue (§5)
 	dispatched := p.TryEnqueueOrDispatch(&item)
-	if dispatched {
-		return
-	}
+	_ = dispatched
+	// Wait for the queue worker (or inline dispatch) to complete the request.
+	<-done
 }
 
 func (p *Proxy) HandleConfigGet(w http.ResponseWriter, r *http.Request) {
@@ -4478,8 +4705,10 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusBadRequest, map[string]interface{}{"error": "invalid JSON"})
 		return
 	}
+
+	needSignalQueue := false
+
 	p.configMu.Lock()
-	defer p.configMu.Unlock()
 	if v, ok := data["apiKey"].(string); ok {
 		p.Config.APIKey = v
 	}
@@ -4523,6 +4752,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 			p.Config.WallpaperSource = v
 			p.invalidateDashboardCache()
 		default:
+			p.configMu.Unlock()
 			WriteJSON(w, http.StatusBadRequest, map[string]interface{}{
 				"error": "wallpaperSource must be one of: none, bing, wallhaven",
 			})
@@ -4531,6 +4761,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if v, ok := data["overrideConcurrency"].(float64); ok {
 		if v < 0 {
+			p.configMu.Unlock()
 			WriteJSON(w, http.StatusBadRequest, map[string]interface{}{
 				"error": "overrideConcurrency must be >= 0",
 			})
@@ -4540,6 +4771,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if v, ok := data["maxImages"].(float64); ok {
 		if v < 0 {
+			p.configMu.Unlock()
 			WriteJSON(w, http.StatusBadRequest, map[string]interface{}{
 				"error": "maxImages must be >= 0",
 			})
@@ -4582,7 +4814,8 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 			// When switching to manual mode with manualLimit == 0,
 			// initialize it to the current soft cap (or hard cap if no soft cap).
 			if mode == "manual" && p.getManualLimit() == 0 {
-				eff := p.GetEffectiveConcurrency(p.LastConcurrency)
+				override := p.Config.OverrideConcurrency
+				eff := p.GetEffectiveConcurrency(p.LastConcurrency, override)
 				var defaultLimit int
 				if eff.Limit != nil {
 					defaultLimit = *eff.Limit
@@ -4594,9 +4827,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 				p.Config.ManualConcurrencyLimit = defaultLimit
 				p.setManualLimit(defaultLimit)
 			}
-			// Any mode change can change the gate, so always process the queue
+			// Any mode change can change the gate, so signal the queue
 			// to dispatch waiting items or clear stale state.
-			p.triggerProcessQueue()
+			needSignalQueue = true
 		}
 		// §6.4: invalidate cached gate on concurrency mode change
 		p.invalidateGateCache()
@@ -4610,7 +4843,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		p.setManualLimit(limit)
 		// §6.4: invalidate cached gate on manual limit change
 		p.invalidateGateCache()
-		p.triggerProcessQueue()
+		needSignalQueue = true
 	}
 	if v, ok := data["slotFreeDelay"].(float64); ok {
 		delay := int(v)
@@ -4647,6 +4880,7 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		p.Config.RequestTimeout = Duration{time.Duration(secs) * time.Second}
 		if p.Upstream != nil {
 			p.Upstream.SetTimeout(p.Config.RequestTimeout.Duration)
+			p.Upstream.CloseIdleConnections()
 		}
 	}
 	if v, ok := data["keys"].([]interface{}); ok {
@@ -4669,10 +4903,9 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		p.Config.Keys = keys
 		p.KeyPool = NewKeyPool(keys)
 	}
-	debouncedSaveConfig(*p.Config)
-	p.invalidateDashboardCache()
 
-	WriteJSON(w, http.StatusOK, map[string]interface{}{
+	// Snapshot response data while holding the lock.
+	respData := map[string]interface{}{
 		"success":                   true,
 		"listenAddr":                p.Config.ListenAddr,
 		"upstreamBaseURL":           p.Config.UpstreamBaseURL,
@@ -4688,14 +4921,27 @@ func (p *Proxy) HandleConfigPost(w http.ResponseWriter, r *http.Request) {
 		"visionHandoffCacheEnabled": p.Config.VisionHandoffCacheEnabled,
 		"wallpaperSource":           p.Config.WallpaperSource,
 		"apikeyMode":                p.Config.ApiKeyMode,
-		"concurrencyLimitMode":   p.getConcurrencyLimitMode(),
-		"manualConcurrencyLimit": p.getManualLimit(),
-		"slotFreeDelay":            p.Config.SlotFreeDelay,
-		"retryAttempts":            p.getRetryAttempts(),
-		"backoffStrategy":          p.getBackoffStrategy(),
-		"requestTimeout":           p.Config.RequestTimeout.DurationMs() / 1000,
-		"restartRequired":           restartRequired,
-	})
+		"concurrencyLimitMode":      p.getConcurrencyLimitMode(),
+		"manualConcurrencyLimit":    p.getManualLimit(),
+		"slotFreeDelay":              p.Config.SlotFreeDelay,
+		"retryAttempts":              p.getRetryAttempts(),
+		"backoffStrategy":            p.getBackoffStrategy(),
+		"requestTimeout":             p.Config.RequestTimeout.DurationMs() / 1000,
+		"restartRequired":            restartRequired,
+	}
+	debouncedSaveConfig(*p.Config)
+	p.invalidateDashboardCache()
+
+	// Release configMu BEFORE calling signalQueue to avoid lock-order inversion
+	// with queue paths that hold queueMu and then call gateLimit() (which needs
+	// configMu.RLock()).
+	p.configMu.Unlock()
+
+	if needSignalQueue {
+		p.signalQueue()
+	}
+
+	WriteJSON(w, http.StatusOK, respData)
 }
 
 func (p *Proxy) HandleKeysGet(w http.ResponseWriter, r *http.Request) {
@@ -4889,7 +5135,10 @@ func (p *Proxy) HandleConcurrency(w http.ResponseWriter, r *http.Request) {
 	activeRequests := p.getActiveRequests()
 	queueLen := p.getQueueLen()
 
-	eff := p.GetEffectiveConcurrency(lastConcurrency)
+	p.configMu.RLock()
+	override := p.Config.OverrideConcurrency
+	p.configMu.RUnlock()
+	eff := p.GetEffectiveConcurrency(lastConcurrency, override)
 	resp := map[string]interface{}{
 		"concurrent": eff.Concurrent,
 		"active":     activeRequests,
@@ -4978,32 +5227,43 @@ func (p *Proxy) flushErrorLog() {
 // 6. Flush and close the error log file.
 // 7. Call exitFn(0) (or os.Exit(0) if exitFn is nil).
 func (p *Proxy) Shutdown() {
+	// 1. Stop accepting new work and signal queue worker to exit.
 	p.shuttingDown.Store(true)
-	p.stopProcessQueueTrigger()
 
-	// Reject queued items under queueMu
+	// 2. Wake the queue worker so it observes shutdown and exits.
+	p.queueMu.Lock()
+	p.queuePending = false
+	p.queueMu.Unlock()
+	p.queueShutdownOnce.Do(func() { close(p.queueDone) })
+	p.queueCond.Broadcast()
+	p.workerWG.Wait()
+
+	// 3. Reject any queued items. No new items can arrive because handlers
+	//    check shuttingDown first and TryEnqueueOrDispatch rejects when true.
 	p.queueMu.Lock()
 	p.rejectQueueLocked()
 	p.queueMu.Unlock()
 
-	// Proxy-level drain: poll ActiveRequests until 0 or 5-second timeout.
-	pollTimeout := time.After(5 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// 4. Drain active requests until zero or deadline.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-pollLoop:
+drainLoop:
 	for {
 		p.queueMu.RLock()
 		active := p.ActiveRequests
 		p.queueMu.RUnlock()
 		if active <= 0 {
-			break pollLoop
+			break drainLoop
 		}
 		select {
-		case <-pollTimeout:
-			break pollLoop
+		case <-deadline:
+			break drainLoop
 		case <-ticker.C:
 		}
 	}
+
+	// 5. Close the HTTP server.
 	if p.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -5430,16 +5690,19 @@ func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]int
 		return 0
 	}
 
+	// 4.3: Cap image parts to avoid excessive handoff calls.
+	maxImages := p.getVisionHandoffLimit()
+	if maxImages <= 0 {
+		maxImages = 4
+	}
+	if len(parts) > maxImages {
+		parts = parts[:maxImages]
+	}
+
 	handoffModel := p.Config.VisionHandoffModel
 	if handoffModel == "" {
 		handoffModel = "umans-coder"
 	}
-
-	limit := p.Config.VisionHandoffConcurrency
-	if limit <= 0 {
-		limit = 4
-	}
-	sem := make(chan struct{}, limit)
 
 	descriptions := make([]string, len(parts))
 	var wg sync.WaitGroup
@@ -5447,13 +5710,22 @@ func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]int
 		wg.Add(1)
 		go func(idx int, dataURI string) {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
+			// 4.1: Use proxy-wide vision-handoff semaphore instead of local one.
+			// Only acquire/release when p.visionHandoffSem != nil.
+			if p.visionHandoffSem != nil {
+				select {
+				case p.visionHandoffSem <- struct{}{}:
+				case <-ctx.Done():
+					descriptions[idx] = "[Image analysis cancelled]"
+					return
+				}
+				defer func() { <-p.visionHandoffSem }()
+			}
+			// 4.2: Check ctx.Err() before sending the handoff request.
+			if ctx.Err() != nil {
 				descriptions[idx] = "[Image analysis cancelled]"
 				return
 			}
-			defer func() { <-sem }()
 			if p.Upstream == nil {
 				descriptions[idx] = p.HandoffResponse
 				return
@@ -5594,16 +5866,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					},
 				})
 
-				tw.mu.Lock()
-				alreadyWritten := tw.written
-				if !alreadyWritten {
-					tw.hijacked = true
-				}
-				tw.mu.Unlock()
-
-				if !alreadyWritten {
-					WriteOpenAIError(tw, http.StatusInternalServerError,
-						"internal server error", "server_error", "")
+				if tw.Claim() {
+					// Write directly to the underlying writer, bypassing
+					// WriteJSON/IsCommitted (which would skip since Claim set
+					// hijacked=true). This ensures the 500 reaches the client.
+					errObj, _ := json.Marshal(map[string]interface{}{
+						"error": map[string]interface{}{
+							"message": "internal server error",
+							"type":    "server_error",
+						},
+					})
+					tw.ResponseWriter.Header().Set("Content-Type", "application/json")
+					tw.ResponseWriter.WriteHeader(http.StatusInternalServerError)
+					tw.ResponseWriter.Write(errObj)
 				} else if tw.Header().Get("Content-Type") == "text/event-stream" {
 					errEv := SSEEvent{
 						Event: "error",
@@ -5623,20 +5898,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Timeout fired. If the response is already streaming (SSE), don't
 		// kill it — let the upstream stream continue. The timeout applies to
 		// the pre-streaming phase (queue + connect + first byte), not to the
-		// streaming duration. Only hijack if nothing has been written yet.
-		tw.mu.Lock()
-		alreadyWritten := tw.written
-		if !alreadyWritten {
-			// Mark aborted so any concurrent writer (including queued dispatch
-			// that starts after this point) becomes a no-op.
-			tw.aborted = true
-			tw.hijacked = true
-		}
-		tw.mu.Unlock()
-
-		if !alreadyWritten {
-			WriteOpenAIError(tw, http.StatusGatewayTimeout,
-				"request timeout", "server_error", "timeout")
+		// streaming duration.
+		//
+		// Use Claim() to atomically set written+hijacked BEFORE writing to
+		// the underlying writer. This closes the race window: once hijacked
+		// is set, all tracker methods (WriteHeader, Write, Flush) become
+		// no-ops for the handler goroutine, preventing a concurrent handler
+		// Write from triggering a superfluous WriteHeader on the underlying
+		// writer.
+		if tw.Claim() {
+			errObj, _ := json.Marshal(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "request timeout",
+					"type":    "server_error",
+					"code":    "timeout",
+				},
+			})
+			tw.ResponseWriter.Header().Set("Content-Type", "application/json")
+			tw.ResponseWriter.WriteHeader(http.StatusGatewayTimeout)
+			tw.ResponseWriter.Write(errObj)
 		}
 		// If already streaming, do NOT inject a timeout error into the stream.
 		// Wait for the handler goroutine to finish naturally (upstream EOF or error).
@@ -5723,6 +6003,9 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "text/html")
+		if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(rendered))
 	case path == "/dashboard.js":
@@ -5733,6 +6016,9 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Header().Set("Cache-Control", "no-cache")
+		if tw, ok := w.(*responseWriterTracker); ok && tw.IsCommitted() {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write(js)
 	case path == "/healthz":

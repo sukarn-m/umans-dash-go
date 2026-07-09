@@ -325,6 +325,7 @@ type QueueItem struct {
 	Fingerprint           string // conversation fingerprint for session affinity
 	PreferredKeyIndex     int    // -1 = no preference, ≥0 for specific key
 	IsStream              bool   // whether this is a streaming request
+	Done                  chan struct{} // closed by runDispatch when the request completes
 }
 
 // HttpErrorRecord captures the context for an HTTP error log entry per SPEC §15.5.
@@ -495,7 +496,13 @@ type Proxy struct {
 	QueueLen          int
 	// Concurrency queue (§5)
 	queueMu      sync.RWMutex
-	requestQueue []QueueItem
+	queueCond    *sync.Cond // sync.NewCond(&p.queueMu) — RWMutex satisfies sync.Locker
+	requestQueue []*QueueItem
+	queuePending bool          // true when a ProcessQueue pass is scheduled
+	queueDone    chan struct{} // closed during shutdown
+	workerWG     sync.WaitGroup
+	queueShutdownOnce sync.Once // guards close(queueDone)
+	visionHandoffSem  chan struct{} // proxy-wide vision-handoff concurrency limit (nil if disabled)
 
 	// Catalog maps (§8) — protects ModelInfoMap and DisplayNameMap
 	catalogMu sync.RWMutex
@@ -560,10 +567,6 @@ type Proxy struct {
 
 	// §5.1 graceful shutdown/restart
 	shuttingDown atomic.Bool
-
-	// §3 ProcessQueue trigger debounce
-	pqTriggerMu    sync.Mutex
-	pqTriggerTimer *time.Timer
 
 	// §6.4 cached gate limit
 	cachedGate      int
@@ -644,6 +647,23 @@ func (rw *responseWriterTracker) Abort() {
 	rw.mu.Lock()
 	rw.aborted = true
 	rw.mu.Unlock()
+}
+
+// Claim atomically marks the response as taken over by middleware (timeout
+// or panic recovery). Returns true if this call successfully claimed the
+// response, false if it was already written, hijacked, or aborted.
+// After a successful claim, all tracker methods (WriteHeader, Write, Flush)
+// become no-ops for the handler goroutine, closing the race window between
+// middleware takeover and concurrent handler writes.
+func (rw *responseWriterTracker) Claim() bool {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.written || rw.hijacked || rw.aborted {
+		return false
+	}
+	rw.written = true
+	rw.hijacked = true
+	return true
 }
 
 // Flush is hijack-aware so that SSE error events aren't written after the

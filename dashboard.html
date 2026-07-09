@@ -337,15 +337,18 @@
     #manualLimitWrapper .form-range:disabled { opacity:0.4; cursor:not-allowed; }
     /* ---- Retry / Timeout sliders (reuse manual-limit thumb styling) ---- */
     #retryAttemptsSlider.form-range,
-    #requestTimeoutSlider.form-range { height:0.5rem; padding:0; cursor:pointer; }
+    #requestTimeoutSlider.form-range,
+    #slotFreeDelaySlider.form-range { height:0.5rem; padding:0; cursor:pointer; }
     #retryAttemptsSlider.form-range::-webkit-slider-thumb,
-    #requestTimeoutSlider.form-range::-webkit-slider-thumb {
+    #requestTimeoutSlider.form-range::-webkit-slider-thumb,
+    #slotFreeDelaySlider.form-range::-webkit-slider-thumb {
       -webkit-appearance:none; width:14px; height:14px; border-radius:50%;
       background:#6366f1; border:2px solid rgba(255,255,255,0.8);
       box-shadow:0 0 8px rgba(99,102,241,0.4);
     }
     #retryAttemptsSlider.form-range::-moz-range-thumb,
-    #requestTimeoutSlider.form-range::-moz-range-thumb {
+    #requestTimeoutSlider.form-range::-moz-range-thumb,
+    #slotFreeDelaySlider.form-range::-moz-range-thumb {
       width:14px; height:14px; border-radius:50%;
       background:#6366f1; border:2px solid rgba(255,255,255,0.8);
       box-shadow:0 0 8px rgba(99,102,241,0.4);
@@ -545,7 +548,7 @@
                   <button class="btn btn-outline-action btn-refresh" data-refresh="30" onclick="setRefreshInterval('30')">30s</button>
                   <button class="btn btn-outline-action btn-refresh" data-refresh="60" onclick="setRefreshInterval('60')">1m</button>
                   <button class="btn btn-outline-action btn-refresh" data-refresh="120" onclick="setRefreshInterval('120')">2m</button>
-                  <button class="btn btn-outline-action btn-refresh" data-refresh="298" onclick="setRefreshInterval('298')">5m</button>
+                  <button class="btn btn-outline-action btn-refresh" data-refresh="300" onclick="setRefreshInterval('300')">5m</button>
                 </div>
               </div>
               <div class="mb-2">
@@ -615,9 +618,30 @@
                   Slot Free Delay
                   <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="Delay (in seconds) before freeing a concurrency slot after a request completes. 0 = immediate. Useful to avoid upstream rate limits."></i>
                 </label>
-                <input type="number" class="form-control form-control-sm" id="slotFreeDelayInput" min="0" step="1" value="0"
-                       style="background:rgba(0,0,0,0.25);border:1px solid var(--bd-1);color:#fff;font-size:0.75rem"
+                <div class="d-flex justify-content-between align-items-center" style="font-size:0.65rem;color:rgba(255,255,255,0.6);margin-bottom:2px;">
+                  <span>0s</span>
+                  <span id="slotFreeDelayValue" style="color:#c7d2fe;font-weight:600;">--</span>
+                  <span>60s</span>
+                </div>
+                <input type="range" class="form-range" id="slotFreeDelaySlider" min="0" max="60" step="1" value="2"
+                       style="accent-color: #6366f1;"
+                       oninput="onSlotFreeDelayInput(this.value)"
                        onchange="onSlotFreeDelayChange(this.value)">
+              </div>
+              <div class="mb-2">
+                <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">
+                  Request Timeout
+                  <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="Timeout for upstream API requests. Range: 30s to 30m. Applied live without restart."></i>
+                </label>
+                <div class="d-flex justify-content-between align-items-center" style="font-size:0.65rem;color:rgba(255,255,255,0.6);margin-bottom:2px;">
+                  <span>30s</span>
+                  <span id="requestTimeoutValue" style="color:#c7d2fe;font-weight:600;">--</span>
+                  <span>30m</span>
+                </div>
+                <input type="range" class="form-range" id="requestTimeoutSlider" min="30" max="1800" step="30" value="300"
+                       style="accent-color: #6366f1;"
+                       oninput="onRequestTimeoutInput(this.value)"
+                       onchange="onRequestTimeoutChange(this.value)">
               </div>
               <div class="mb-2">
                 <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">
@@ -646,21 +670,6 @@
                   <option value="conservative">Conservative (5s→300s)</option>
                 </select>
                 <div id="backoffPreview" style="font-size:0.6rem;color:rgba(255,255,255,0.5);margin-top:2px"></div>
-              </div>
-              <div class="mb-2">
-                <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">
-                  Request Timeout
-                  <i class="bi bi-info-circle" style="cursor:help;color:rgba(255,255,255,0.7)" data-bs-toggle="tooltip" data-bs-html="true" title="Timeout for upstream API requests. Range: 30s to 30m. Applied live without restart."></i>
-                </label>
-                <div class="d-flex justify-content-between align-items-center" style="font-size:0.65rem;color:rgba(255,255,255,0.6);margin-bottom:2px;">
-                  <span>30s</span>
-                  <span id="requestTimeoutValue" style="color:#c7d2fe;font-weight:600;">--</span>
-                  <span>30m</span>
-                </div>
-                <input type="range" class="form-range" id="requestTimeoutSlider" min="30" max="1800" step="30" value="300"
-                       style="accent-color: #6366f1;"
-                       oninput="onRequestTimeoutInput(this.value)"
-                       onchange="onRequestTimeoutChange(this.value)">
               </div>
             </div>
           </div>

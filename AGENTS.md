@@ -36,7 +36,8 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 | `KeyConfig` | A single API key entry (name, key, session) |
 | `KeyPool` | Round-robin multi-key pool with cooldown/unhealthy marking |
 | `ImageHandoffCache` | LRU cache for vision handoff image descriptions (SHA-256 keyed, 50 entries, 24h TTL) |
-| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state; `retryConfigMu` (`RWMutex`) / `retryAttempts` / `backoffStrategy` for thread-safe retry config state |
+| `QueueItem` | A queued or in-flight request: `Response`, `Req` (with **detached context** via `context.WithoutCancel` so it survives `ServeHTTP` return), `Payload`, `Model`, `Format` (`"openai"`/`"anthropic"`), `WriteError`/`WritePassthroughError`, `Fingerprint`, `PreferredKeyIndex`, `IsStream`, and **`Done chan struct{}`** — closed by `runDispatch` (via defer) and all rejection paths when the request completes; handlers block on `<-done` to keep `ServeHTTP` alive until the request finishes |
+| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state; `retryConfigMu` (`RWMutex`) / `retryAttempts` / `backoffStrategy` for thread-safe retry config state. Queue infrastructure: `queueCond` (`*sync.Cond` bound to `queueMu`), `queuePending` (bool — a `ProcessQueue` pass is scheduled), `queueDone` (`chan struct{}` — closed during shutdown to cancel pending slot-free delays), `workerWG` (`sync.WaitGroup` for the queue worker goroutine), `queueShutdownOnce` (`sync.Once` guarding `close(queueDone)`), `visionHandoffSem` (`chan struct{}` — proxy-wide vision-handoff concurrency limit, nil if disabled) |
 | `ModelInfo` / `Capabilities` | Model metadata from upstream catalog |
 | `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types |
 | `ConcurrencyData` | Concurrency limits and current state |
@@ -113,10 +114,10 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) getManualLimit() int` — thread-safe read under `concurrencyLimitMu.RLock`
 - `(*Proxy) setManualLimit(limit int)` — thread-safe write under `concurrencyLimitMu.Lock`; clamps to ≥ 1
 - `(*Proxy) getSlotFreeDelay() int` — reads `Config.SlotFreeDelay` under `configMu.RLock`
-- `(*Proxy) gateLimit() int` — returns the effective concurrency gate based on mode: `soft` → soft cap (`Limit`), `hard` → hard cap (`HardCap`) if available else `Limit`, `manual` → `ManualConcurrencyLimit` clamped to `[1, HardCap]` (falls back to soft cap if `ManualConcurrencyLimit` is 0/uninitialized); returns `-1` if no gate applies
+- `(*Proxy) gateLimit() int` — returns the effective concurrency gate based on mode: `soft` → soft cap (`Limit`), `hard` → hard cap (`HardCap`) if available else `Limit`, `manual` → `ManualConcurrencyLimit` clamped to `[1, HardCap]` (falls back to soft cap if `ManualConcurrencyLimit` is 0/uninitialized); returns `-1` if no gate applies. Snapshots `OverrideConcurrency` under `configMu.RLock`, then calls `GetEffectiveConcurrency(lastConcurrency, override)` (which takes `override` as a parameter — no longer reads `configMu` internally — to avoid recursive locking when called from `HandleConfigPost` or `gateLimit`).
 - `Config.ConcurrencyLimitMode` (JSON `CONCURRENCY_LIMIT_MODE`) and `Config.ManualConcurrencyLimit` (JSON `MANUAL_CONCURRENCY_LIMIT`) persisted via `saveConfig()`; restored in `NewProxy()` on startup. Old `BURST_MODE` bool migrated: `true` → `"hard"`, `false`/missing → `"soft"`. `BurstMode` kept in sync (`true` when mode is `"hard"`) for rollback safety.
 - `Config.SlotFreeDelay` (JSON `SLOT_FREE_DELAY`) — delay in seconds before `OnRequestComplete()` decrements `ActiveRequests`. Default 0 (immediate).
-- `HandleConfigPost` calls `ProcessQueue()` on any mode change (not just `hard`/`manual`) since switching to `soft` from a more restrictive mode can also raise the gate. When switching to `manual` with `manualLimit == 0`, initializes it to the current soft cap (or hard cap if no soft cap).
+- `HandleConfigPost` calls `signalQueue()` on any mode change (not just `hard`/`manual`) since switching to `soft` from a more restrictive mode can also raise the gate. The call happens **after** `configMu.Unlock()` to avoid lock-order inversion. When switching to `manual` with `manualLimit == 0`, initializes it to the current soft cap (or hard cap if no soft cap).
 
 ### Retry Config & Backoff
 - `(*Proxy) getRetryAttempts() int` — thread-safe read under `retryConfigMu.RLock`; uses `< 0` guard (not `<= 0`) so explicit 0 (no retries) passes through. Clamps to `MaxRetryAttemptsCap` (10). Returns `DefaultRetryAttempts` (2) when negative.
@@ -131,6 +132,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `HandleConfigGet` exposes `retryAttempts`, `backoffStrategy`, `requestTimeout` (seconds).
 - Retry applies to both OpenAI (`proxyChatRequest`) and Anthropic (`proxyAnthropicRequest`) paths.
 - `(*UpstreamClient) SetTimeout(timeout time.Duration)` — live-updates `httpClient.Timeout` and transport's `ResponseHeaderTimeout` without restart.
+- `(*UpstreamClient) CloseIdleConnections()` — closes idle connections on the underlying transport. Called by `HandleConfigPost` after `SetTimeout` to force new connections with the updated timeout.
 - `NewUpstreamClient` uses the configured timeout for `ResponseHeaderTimeout` (was hardcoded 300s).
 
 ### Panic Safety & SSE Streaming
@@ -139,22 +141,29 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - **`writeSSEErrorEvent`** — panic-safe: wrapped in `defer func() { recover() }()` so writing an error event to a dead/hijacked connection is silently swallowed.
 - **`writeSSEHeaders`** — delegates to `responseWriterTracker.commitSSE()` when the writer is a tracker, making header commitment atomic under the tracker lock and guarded against `written`/`hijacked`/`aborted`.
 - **`responseWriterTracker`** — wraps the real `ResponseWriter` with `written`/`hijacked`/`aborted` tracking and implements `http.Hijacker`. `WriteHeader`/`Write`/`Flush` return early if the response is hijacked, written, or aborted. Used by the timeout middleware (`ServeHTTP`) to safely take over the response when a request times out.
+- **`Claim()`** — atomic method on `responseWriterTracker` that sets both `written=true` and `hijacked=true` under the mutex in a single step. Returns `true` on success (caller then writes directly to the underlying `ResponseWriter`, bypassing `WriteJSON`/`IsCommitted`). Returns `false` if already `written`/`hijacked`/`aborted`. Used by the `ServeHTTP` timeout path and panic recovery handler to claim the response before writing the error, closing the race window where a concurrent handler write could trigger a superfluous `WriteHeader`.
+- **`IsCommitted()` guards** — added to the non-streaming JSON response path (`WriteJSON`), the Anthropic passthrough success path, and dashboard handlers (`/`, `/dashboard.js`). Each checks `IsCommitted()` and returns early instead of relying on the tracker's silent no-op, preventing "superfluous response.WriteHeader" log warnings.
 - **Retry callback panic recovery** — both OpenAI and Anthropic retry callbacks use named return values (`retry bool, err error`) with a `defer` recovery that logs the panic with `attempt`, `isLast`, and `headersCommitted` state, then returns the error to the retry loop.
 
 ### Request Lifecycle & Queueing
-- **`ServeHTTP`** — wraps every request in a `responseWriterTracker`, enforces `REQUEST_TIMEOUT` for the pre-streaming phase, and supports request abort on timeout. Streaming responses continue after timeout.
-- **`dispatchItem(item *QueueItem)`** — single dispatch path used for both direct dispatch and queued dispatch. Increments `ActiveRequests`, runs `defer OnRequestComplete()` exactly once, and guards against aborted/committed responses.
-- **`TryEnqueueOrDispatch(item)`** — owns `ActiveRequests` increment for direct dispatch and rejects new requests during shutdown.
-- **`ProcessQueue()`** — dispatches queued items while capacity exists, drops items whose client context was cancelled or response was aborted, and early-returns when shutting down.
-- **`OnRequestComplete()`** — decrements `ActiveRequests` (after optional `SlotFreeDelay`) and triggers `ProcessQueue()`.
-- **`Shutdown()`** — sets shutdown flag, rejects queued requests with 503, drains active requests, then exits.
+- **`ServeHTTP`** — wraps every request in a `responseWriterTracker`, enforces `REQUEST_TIMEOUT` for the pre-streaming phase, and supports request abort on timeout. Streaming responses continue after timeout. Both the timeout path and the panic-recovery handler use `tw.Claim()` to atomically set `written=true` + `hijacked=true` under the mutex before writing the error directly to the underlying `ResponseWriter` (bypassing `WriteJSON`/`IsCommitted`). Once `hijacked` is set, all tracker methods (`WriteHeader`, `Write`, `Flush`) become no-ops for the handler goroutine, preventing concurrent writes.
+- **`queueWorker()`** — background goroutine started in `NewProxy`. Waits on `queueCond` (`sync.Cond` bound to `queueMu`). When signaled via `trySignalQueueLocked()`/`signalQueue()`, calls `ProcessQueue()`. Exits when `shuttingDown` is set.
+- **`dispatchItem(item *QueueItem) bool`** — used only for the no-limit fast path in `TryEnqueueOrDispatch`. Reserves a slot under `queueMu` (checks shutdown, context cancellation, committed response), increments `ActiveRequests`, then spawns `runDispatch`. Does NOT call `OnRequestComplete()` — that is exclusively in `runDispatch`'s defer.
+- **`runDispatch(item *QueueItem)`** — executes a request that already owns a slot. Runs the proxy handler (`proxyChatRequest` or `proxyAnthropicRequest`) with panic recovery. Always calls `OnRequestComplete()` via defer in every exit path.
+- **`TryEnqueueOrDispatch(item *QueueItem) bool`** — when `gate >= 0`, all requests go through the queue (no inline dispatch under gate), eliminating gate overshoot. When `gate < 0` (no limit), dispatches immediately via `dispatchItem`. Rejects new requests during shutdown.
+- **`ProcessQueue()`** — the only dispatcher when a concurrency limit is in effect. Reserves slots under `queueMu` by incrementing `ActiveRequests` for each item, removes them from the queue, then launches `runDispatch` goroutines outside the lock. Drains the entire queue when `gate < 0`. Re-checks `shuttingDown` and `gateLimit()` inside the dispatch loop.
+- **`OnRequestComplete()`** — sole decrementer of `ActiveRequests`. If `SlotFreeDelay > 0`, spawns a `queueDone`-aware goroutine that waits for the delay (or exits early on shutdown) before decrementing. Calls `signalQueue()` after decrementing to wake the queue worker.
+- **`signalQueue()` / `trySignalQueueLocked()`** — schedules a `ProcessQueue` pass via `queueCond.Signal()`. `trySignalQueueLocked()` is a no-op if `queuePending` is already true or `shuttingDown` is set. Caller of `trySignalQueueLocked` must hold `queueMu`.
+- **`Shutdown()`** — sets `shuttingDown`, broadcasts `queueCond` to wake the worker, waits for `workerWG`, rejects queued items via `rejectQueueLocked()`, drains active requests (5s timeout), then shuts down the HTTP server. `close(queueDone)` is guarded by `sync.Once` for idempotency.
+- **`ResetQueue()`** — clears queue accounting. Only safe when no in-flight requests exist (their `OnRequestComplete` calls would diverge).
 
 ### Context Propagation
+- **`detachedContext(parent) context.Context`** — wraps parent with `context.WithoutCancel()`, producing a context that is never cancelled and has no deadline, but carries parent values. Used by `HandleChatCompletions` and `HandleMessages` to build the `QueueItem.Req` so queue items survive `ServeHTTP`'s return (where `defer cancel()` would otherwise cancel the original request context and cause every queued request to be rejected as "client disconnected"). The client-disconnect deadline is still propagated via the tracker's `clientCtx` for `pipeBodyToResponse`.
 - **`UpstreamClient.ChatCompletions(ctx, ...)`**, **`Messages(ctx, ...)`**, **`doPost(ctx, ...)`** — accept a caller-supplied context so client disconnects/timeouts cancel in-flight upstream work.
 - **Streaming requests** use the original client context once headers are committed, so long SSE streams are not truncated by the request timeout.
 
 ### Vision Handoff
-- **`PerformVisionHandoff`** — parallel image analysis with a configurable concurrency cap (`VisionHandoffConcurrency`, default 4) to prevent goroutine explosion.
+- **`PerformVisionHandoff`** — parallel image analysis with a **proxy-wide** concurrency cap (`visionHandoffSem` channel on `Proxy`, sized from `VisionHandoffConcurrency`, default 4) to prevent goroutine explosion. This replaces the previous per-call local semaphore, so the cap now limits total concurrent handoff goroutines across all in-flight requests, not just within a single request.
 - **`analyzeImageViaHandoff(ctx, ...)`** — accepts a context for cancellation propagation.
 
 ### Catalog & Concurrency Caching
@@ -171,6 +180,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) Authorized(req *http.Request) bool` — behavior now depends on `ApiKeyMode`: `passthrough` requires a client key present; `smart` always accepts (client or own key used downstream); `managed` validates the client's key against configured `APIKeys` (or accepts if `APIKeys` is empty)
 - `ReadBody(req *http.Request) (string, error)` — 5 MB cap; uses `errors.Is(err, io.EOF)` for clean stream end
 - `pipeBodyToResponse(body, w, r) (int, error)` — copies upstream response body to client with flushing; returns bytes written so caller can detect empty streams
+- `drainAndClose(body io.ReadCloser)` — reads and discards any remaining body data before closing. Ensures the underlying TCP connection can be reused (HTTP keep-alive) instead of being discarded on an unread body.
 - **Empty SSE stream detection** — before committing SSE headers to the client, the proxy peeks at the first chunk from the upstream body. If 0 bytes + EOF (empty stream), it treats this as a retryable 502 error (logs, retries with key rotation). Prevents the "empty stream with no finish_reason" client error.
 - `WriteJSON(w, status, payload)`
 - `WriteOpenAIError(w, status, message, errType, code)`
@@ -189,7 +199,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 ### HTTP Handlers
 - `(*Proxy) HandleHealthz(w, r)` / `HandleModels(w, r)` / `HandleConfigGet(w, r)` — `HandleConfigGet` exposes `apikeyMode`, `concurrencyLimitMode`, `manualConcurrencyLimit`, and `slotFreeDelay` fields
-- `(*Proxy) HandleConfigPost(w, r)` — accepts `apikeyMode` (`managed`/`passthrough`/`smart`), `concurrencyLimitMode` (`soft`/`hard`/`manual`), `manualConcurrencyLimit` (int, clamped ≥ 1), `slotFreeDelay` (int seconds, clamped ≥ 0); syncs `BurstMode` for rollback safety; auto-initializes `manualLimit` to soft cap when switching to manual with limit 0; triggers `ProcessQueue()` on any mode change; triggers debounced save
+- `(*Proxy) HandleConfigPost(w, r)` — accepts `apikeyMode` (`managed`/`passthrough`/`smart`), `concurrencyLimitMode` (`soft`/`hard`/`manual`), `manualConcurrencyLimit` (int, clamped ≥ 1), `slotFreeDelay` (int seconds, clamped ≥ 0); syncs `BurstMode` for rollback safety; auto-initializes `manualLimit` to soft cap when switching to manual with limit 0; **releases `configMu` before calling `signalQueue()`** to avoid lock-order inversion with queue paths (which acquire `queueMu` then call `gateLimit()` → `configMu.RLock`); on `requestTimeout` change, calls `Upstream.SetTimeout()` then `Upstream.CloseIdleConnections()`; triggers debounced save
 - `(*Proxy) HandleKeysGet(w, r)` / `HandleKeysPost(w, r)` — `HandleKeysGet` acquires `configMu.RLock()`
 - `(*Proxy) HandleUsage(w, r)` / `HandleConcurrency(w, r)` — `HandleConcurrency` response includes `concurrency_limit_mode` and `manual_limit` fields; `FetchUsage`/`FetchUsageHistory` call `upstreamAPIKeyForDashboard()` before upstream calls
 - `(*Proxy) HandleUsageHistory(w, r)` / `HandleUser(w, r)` — `HandleUser` returns `user_id` from `LastConcurrency`
@@ -229,7 +239,7 @@ The `Proxy` struct holds several dedicated mutexes. Code touching these fields m
 | Mutex | Protects | Notes |
 |-------|----------|-------|
 | `configMu` (RWMutex) | All `Config` fields | `RLock()` in read-only handlers (`ResolveModelId`, `NeedsVisionHandoff`, `HandleKeysGet`, `HandleConfigGet`). `Lock()` in `HandleConfigPost` / mutations. **Note:** `proxyChatRequest` and `proxyAnthropicRequest` now snapshot needed config fields (`ApiKeyMode`, `MaxImages`, `UpstreamBaseURL`) under a brief `RLock` then release before the upstream call — previously held `RLock` for the entire request lifecycle, blocking `HandleConfigPost`. |
-| `queueMu` (RWMutex) | `ActiveRequests`, `requestQueue`, `ThrottledCount` | All access via accessor helpers (`getActiveRequests`, `getQueueLen`, `getThrottledCount`, `bumpThrottled`). Never read/write these fields directly. |
+| `queueMu` (RWMutex) | `ActiveRequests`, `requestQueue` (`[]*QueueItem`), `ThrottledCount`, `queueCond`, `queuePending`, `QueueLen` | All access via accessor helpers (`getActiveRequests`, `getQueueLen`, `getThrottledCount`, `bumpThrottled`). `sync.Cond` (`queueCond`) is bound to `queueMu` — `Wait()` uses write lock/unlock. Readers (dashboard) use `RLock()`/`RUnlock()` to avoid blocking the cond. Only the queue worker and `signalQueue`/`trySignalQueueLocked` use `Lock()`/`Unlock()`. **Lock ordering:** acquire `queueMu` BEFORE `configMu`/`concurrencyLimitMu`/`catalogMu`. Config handlers that mutate config must release their lock before calling `signalQueue()`/`ProcessQueue()`. |
 | `catalogMu` (RWMutex) | `ModelInfoMap`, `DisplayNameMap` | `Lock()` in `ApplyCatalogData`; `RLock()` in all catalog readers. |
 | `convMu` (Mutex) | `conversationMap`, `globalSessionCounter` | Used by both OpenAI and Anthropic paths for session tracking. |
 | `rw.mu` (in `responseWriterTracker`) | Hijack/flush state | `Flush()` acquires `rw.mu`, checks `hijacked`, releases the lock, then calls `Flush()` — preventing flush-after-hijack panics. |
@@ -237,7 +247,7 @@ The `Proxy` struct holds several dedicated mutexes. Code touching these fields m
 | `concurrencyLimitMu` (RWMutex) | `concurrencyLimitMode`, `manualLimit` | `Lock()` in `setConcurrencyLimitMode`/`setManualLimit`; `RLock()` in `getConcurrencyLimitMode`/`getManualLimit`. `gateLimit()` takes one `RLock` and reads both fields atomically. Gates `gateLimit()`: `soft` → soft cap (`Limit`), `hard` → hard cap (`HardCap`), `manual` → `manualLimit` clamped to `[1, HardCap]`. Restored from `Config.ConcurrencyLimitMode` in `NewProxy()`. |
 | `retryConfigMu` (RWMutex) | `retryAttempts`, `backoffStrategy` | `Lock()` in `setRetryConfig`; `RLock()` in `getRetryAttempts`/`getBackoffStrategy`. `getRetryAttempts()` uses `< 0` guard (not `<= 0`) so explicit 0 passes through. Restored from `Config.RetryAttempts` / `Config.BackoffStrategy` in `NewProxy()`. |
 
-**Graceful shutdown** (`Shutdown()`): polls `ActiveRequests` under `queueMu.RLock` every 100ms (5s timeout) before calling `httpServer.Shutdown()`, ensuring in-flight requests drain before the listener closes.
+**Graceful shutdown** (`Shutdown()`): sets `shuttingDown`, broadcasts `queueCond` and closes `queueDone` (guarded by `sync.Once`) to wake the queue worker and cancel pending slot-free delays, then waits for `workerWG` (the queue worker goroutine exits on shutdown). After the worker exits, it rejects all queued items via `rejectQueueLocked()` (503 to each), then polls `ActiveRequests` under `queueMu.RLock` every 50 ms (5 s timeout) before calling `httpServer.Shutdown()`, ensuring in-flight requests drain before the listener closes.
 
 ## Dependencies
 

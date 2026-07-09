@@ -14,7 +14,7 @@ This is a Go port and opinionated customization of the original Node.js project 
 - **Anthropic Messages API** — Pass-through for `/v1/messages` (Anthropic-compatible clients)
 - **Multi-Key Pool** — Round-robin key pool with unhealthy marking, cooldowns, and persistence across restarts
 - **Automatic Upstream Retry** — Retries failed requests on HTTP 500/503 and network failures up to a configurable number of attempts (default 2, range 0–10) with configurable backoff presets (aggressive or conservative), rotating to a fresh key on each attempt. Applies to both OpenAI and Anthropic paths
-- **Concurrency Queue** — Bounded request queue gated by Concurrency Limit mode (Soft Cap, Hard Cap, or Manual with a custom slider), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full. A configurable Slot Free Delay (seconds) can pause before freeing a slot after request completion to avoid upstream rate limits
+- **Concurrency Queue** — Bounded request queue gated by Concurrency Limit mode (Soft Cap, Hard Cap, or Manual with a custom slider), with soft-limit (limit) and hard-cap (burst) tracking, throttled-503 counter, and rejection when full. A background queue worker with `sync.Cond` signaling dispatches queued requests when slots free up. A configurable Slot Free Delay (seconds) can pause before freeing a slot after request completion to avoid upstream rate limits
 - **Dashboard** — Clean UI with usage cards, concurrency monitoring, usage history chart with sortable tables, model management, key management, and configuration
 - **API Key Mode** — Smart (default), Managed, or Pass-Through mode controlling which API key is used for upstream requests (client key vs. proxy key pool)
 - **Empty Stream Detection** — Detects when upstream returns HTTP 200 + `text/event-stream` but sends zero data bytes, and treats it as a retryable error (with configurable retry attempts) instead of forwarding an empty stream to the client
@@ -80,7 +80,13 @@ umans-dash-go/
   - Wallhaven resolution filter (`atleast=2560x1440`) with JPEG/PNG/WebP content-type detection
   - Queue-full responses return HTTP 429 Too Many Requests with `Retry-After` header to discourage immediate retries
   - Response-writer tracker with abort/hijack guards prevents superfluous `WriteHeader` panics and protects streaming responses from timeout middleware races
-  - Unified dispatch path for direct and queued requests with single lifecycle accounting
+  - Unified dispatch path with `sync.Cond`-based queue worker: `ProcessQueue` reserves slots under `queueMu` before launching `runDispatch` goroutines, eliminating gate overshoot; `dispatchItem` used only for the no-limit fast path
+  - `OnRequestComplete` uses a `queueDone`-aware goroutine for slot-free delay instead of blocking `time.Sleep`, allowing shutdown to cancel pending delays without timer/lock deadlocks
+  - Idempotent `Shutdown` via `sync.Once` on `queueDone` close; worker drains before HTTP server shutdown
+  - `GetEffectiveConcurrency` accepts `override int` parameter to avoid recursive `configMu.RLock()` when called from `gateLimit()` or `HandleConfigPost`
+  - `HandleConfigPost` releases `configMu` before calling `signalQueue()` to prevent lock-order inversion
+  - Timeout middleware uses compare-and-set on `tw.written` to claim the response exclusively before writing the timeout error, preventing the "superfluous response.WriteHeader" log warning
+  - `WriteJSON` checks `IsCommitted()` before writing in the non-SSE branch to skip writes on already-committed trackers
   - Request-context propagation through upstream calls so client disconnects cancel in-flight work
   - Configurable vision-handoff concurrency cap (default 4) to prevent goroutine explosion on multi-image requests
   - Shared `catalogClient` for upstream catalog/models/user-info fetches with connection reuse

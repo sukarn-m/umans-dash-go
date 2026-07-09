@@ -140,13 +140,20 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         document.getElementById('manualLimitValue').textContent = prev;
       }
     }
+    function onSlotFreeDelayInput(value) {
+      const v = parseInt(value, 10) || 0;
+      const valEl = document.getElementById('slotFreeDelayValue');
+      if (valEl) valEl.textContent = v + 's';
+    }
     async function onSlotFreeDelayChange(value) {
-      const delay = Math.max(0, parseInt(value, 10) || 0);
-      const input = document.getElementById('slotFreeDelayInput');
+      const delay = Math.max(0, Math.min(60, parseInt(value, 10) || 0));
+      const slider = document.getElementById('slotFreeDelaySlider');
       try {
         const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slotFreeDelay: delay }) });
         if (!r.ok) throw new Error('config save failed');
-        if (input) input.value = delay;
+        if (slider) slider.value = delay;
+        const valEl = document.getElementById('slotFreeDelayValue');
+        if (valEl) valEl.textContent = delay + 's';
       } catch {
         // Revert handled by next loadConfig/fetchConcurrency
       }
@@ -540,8 +547,11 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
           // API key mode init (smart/managed/passthrough)
           setApiKeyModeActive(cd.apikeyMode || 'smart');
           // Slot free delay init
-          const sfdInput = document.getElementById('slotFreeDelayInput');
-          if (sfdInput) sfdInput.value = cd.slotFreeDelay != null ? cd.slotFreeDelay : 0;
+          const sfd = cd.slotFreeDelay != null ? cd.slotFreeDelay : 2;
+          const sfdSlider = document.getElementById('slotFreeDelaySlider');
+          if (sfdSlider) sfdSlider.value = sfd;
+          const sfdVal = document.getElementById('slotFreeDelayValue');
+          if (sfdVal) sfdVal.textContent = sfd + 's';
           // Retry attempts init
           const retryAttempts = cd.retryAttempts != null ? cd.retryAttempts : DEFAULT_RETRY_ATTEMPTS;
           const raSlider = document.getElementById('retryAttemptsSlider');
@@ -728,6 +738,11 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       renderHistory();
     }
     let lastHistoryData = null;
+    // Client-side cache of upstream history responses, keyed by granularity.
+    // Always fetch 30d so 7d, 30d, and 24h are all subsets of one fetch.
+    const historyCache = {}; // { [granularity]: { data, fetchedAt } }
+    const HISTORY_CACHE_TTL = 5 * 60 * 1000; // 5 minutes, matches server-side UsageCacheTTL
+
     async function fetchHistory() {
       const chartEl = document.getElementById('historyChart');
       historyState.loading = true;
@@ -736,11 +751,40 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         chartEl.innerHTML = '<div class="w-100 text-center text-muted" style="font-size:0.75rem;display:flex;align-items:center;justify-content:center;height:100%;gap:6px"><span class="spinner-border spinner-border-sm" role="status"></span>Loading...</div>';
       }
       const { from, to } = getHistoryRange(historyState.range);
+      const gran = historyState.granularity;
+
+      const cached = historyCache[gran];
+      if (cached && (Date.now() - cached.fetchedAt) < HISTORY_CACHE_TTL) {
+        const fromMs = new Date(from).getTime();
+        const toMs = new Date(to).getTime();
+        const filtered = (cached.data.buckets || []).filter(b => {
+          const bMs = new Date(b.bucket || '').getTime();
+          return bMs >= fromMs && bMs <= toMs;
+        });
+        lastHistoryData = { ...cached.data, buckets: filtered };
+        historyState.loading = false;
+        historyState.error = null;
+        renderHistory();
+        return;
+      }
+
+      // Cache miss — always fetch 30d so the cache covers all ranges.
+      const f = new Date(); f.setDate(f.getDate() - 30);
+      const fetchFrom = f.toISOString();
+      const fetchTo = new Date().toISOString();
       try {
-        const r = await fetch(`/api/umans/usage-history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${historyState.granularity}`);
+        const r = await fetch(`/api/umans/usage-history?from=${encodeURIComponent(fetchFrom)}&to=${encodeURIComponent(fetchTo)}&granularity=${gran}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
-        lastHistoryData = d;
+        historyCache[gran] = { data: d, fetchedAt: Date.now() };
+        // Filter to the originally requested range
+        const fromMs = new Date(from).getTime();
+        const toMs = new Date(to).getTime();
+        const filtered = (d.buckets || []).filter(b => {
+          const bMs = new Date(b.bucket || '').getTime();
+          return bMs >= fromMs && bMs <= toMs;
+        });
+        lastHistoryData = { ...d, buckets: filtered };
         historyState.loading = false;
         historyState.error = null;
         renderHistory();
@@ -760,7 +804,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       return Object.values(groups).sort((a, b) => new Date(a.bucket) - new Date(b.bucket));
     }
     function aggregateHistoryTotals(buckets) {
-      let requests = 0, weighted = 0, tokensIn = 0, tokensOut = 0, cachedRead = 0, errorReqs = 0, peakConc = 0;
+      let requests = 0, weighted = 0, tokensIn = 0, tokensOut = 0, cachedRead = 0, errorReqs = 0, peakConc = 0, peakWeighted = 0;
       let allRequests = 0, allErrorReqs = 0;
       for (const b of (buckets || [])) {
         const isErr = ERROR_STATUSES.has(getHistoryStatus(b));
@@ -775,6 +819,8 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         cachedRead += b.tokens_cached_read || 0;
         const peak = b.account_peak_concurrent_requests || b.peak_concurrent_requests || 0;
         if (peak > peakConc) peakConc = peak;
+        const peakW = b.account_peak_weighted_concurrent_requests || b.peak_weighted_concurrent_requests || 0;
+        if (peakW > peakWeighted) peakWeighted = peakW;
         if (isErr) errorReqs += b.requests || 0;
       }
       const cachedPct = tokensIn > 0 ? (cachedRead / tokensIn) * 100 : 0;
@@ -783,7 +829,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       const errorRate = historyState.metric === 'tokens'
         ? (allRequests > 0 ? (allErrorReqs / allRequests) * 100 : 0)
         : (requests > 0 ? (errorReqs / requests) * 100 : 0);
-      return { requests, weighted, tokensIn, tokensOut, cachedRead, cachedPct, errorReqs, errorRate, peakConc };
+      return { requests, weighted, tokensIn, tokensOut, cachedRead, cachedPct, errorReqs, errorRate, peakConc, peakWeighted };
     }
     function getHistoryStatus(b) {
       return b.status || b.error_category || 'ok';
@@ -983,7 +1029,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       // Aggregate each group (date) into a single consolidated row
       const consolidated = groups.map(g => {
         const rows = g.rows.filter(r => !historyState.hiddenStatuses.has(getHistoryStatus(r)));
-        let requests = 0, weighted = 0, tokensIn = 0, tokensOut = 0, cachedRead = 0, peak = 0;
+        let requests = 0, weighted = 0, tokensIn = 0, tokensOut = 0, cachedRead = 0, peak = 0, peakWeighted = 0;
         for (const r of rows) {
           requests += r.requests || 0;
           weighted += r.weighted_requests || 0;
@@ -992,8 +1038,10 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
           cachedRead += r.tokens_cached_read || 0;
           const p = r.account_peak_concurrent_requests || r.peak_concurrent_requests || 0;
           if (p > peak) peak = p;
+          const pw = r.account_peak_weighted_concurrent_requests || r.peak_weighted_concurrent_requests || 0;
+          if (pw > peakWeighted) peakWeighted = pw;
         }
-        return { bucket: g.bucket, rows, requests, weighted, tokensIn, tokensOut, cachedRead, peak };
+        return { bucket: g.bucket, rows, requests, weighted, tokensIn, tokensOut, cachedRead, peak, peakWeighted };
       });
       // Sort consolidated rows by tableSort state
       const tsKey = historyState.tableSort.key;
@@ -1025,7 +1073,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
           <th class="history-table-th" data-sortkey="tokensIn" style="border-color:rgba(255,255,255,0.1);text-align:right;cursor:pointer;user-select:none">Tokens In${tsIcon('tokensIn')}</th>
           <th class="history-table-th" data-sortkey="tokensOut" style="border-color:rgba(255,255,255,0.1);text-align:right;cursor:pointer;user-select:none">Tokens Out${tsIcon('tokensOut')}</th>
           <th class="history-table-th" data-sortkey="cachePct" style="border-color:rgba(255,255,255,0.1);text-align:right;cursor:pointer;user-select:none">Cache %${tsIcon('cachePct')}</th>
-          <th class="history-table-th" data-sortkey="peak" style="border-color:rgba(255,255,255,0.1);text-align:right;cursor:pointer;user-select:none">Peak${tsIcon('peak')}</th>
+          <th class="history-table-th" data-sortkey="peak" style="border-color:rgba(255,255,255,0.1);text-align:right;cursor:pointer;user-select:none" title="Peak concurrent requests → peak weighted concurrent requests (after priority adjustment)">Peak${tsIcon('peak')}</th>
         </tr></thead>
         <tbody>${consolidated.map(c => {
           const t = new Date(c.bucket);
@@ -1036,12 +1084,16 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
           const byModel = {};
           for (const r of c.rows) {
             const name = r.provider === r.model ? (r.model || '') : (r.provider && r.model ? r.model + ' → ' + r.provider : (r.provider || r.model || ''));
-            if (!byModel[name]) byModel[name] = { requests: 0, weighted: 0, tokensIn: 0, tokensOut: 0, cachedRead: 0 };
+            if (!byModel[name]) byModel[name] = { requests: 0, weighted: 0, tokensIn: 0, tokensOut: 0, cachedRead: 0, peak: 0, peakWeighted: 0 };
             byModel[name].requests += r.requests || 0;
             byModel[name].weighted += r.weighted_requests || 0;
             byModel[name].tokensIn += r.tokens_in_total || r.tokens_in || 0;
             byModel[name].tokensOut += r.tokens_out || 0;
             byModel[name].cachedRead += r.tokens_cached_read || 0;
+            const p = r.peak_concurrent_requests || 0;
+            if (p > byModel[name].peak) byModel[name].peak = p;
+            const pw = r.peak_weighted_concurrent_requests || 0;
+            if (pw > byModel[name].peakWeighted) byModel[name].peakWeighted = pw;
           }
           const modelEntries = Object.entries(byModel);
           // Default sort: by current metric descending
@@ -1071,7 +1123,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(m.tokensIn)}</td>
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(m.tokensOut)}</td>
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${mCachePct}</td>
-              <td style="border-color:rgba(255,255,255,0.03)"></td>
+              <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${m.peak === m.peakWeighted ? m.peak : m.peak + ' → ' + m.peakWeighted}</td>
             </tr>`;
           }).join('');
           // Sort indicator helper
@@ -1087,7 +1139,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
             <td style="border-color:rgba(255,255,255,0.05);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(c.tokensIn)}</td>
             <td style="border-color:rgba(255,255,255,0.05);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(c.tokensOut)}</td>
             <td style="border-color:rgba(255,255,255,0.05);text-align:right;font-variant-numeric:tabular-nums">${cachePct}</td>
-            <td style="border-color:rgba(255,255,255,0.05);text-align:right;font-variant-numeric:tabular-nums">${c.peak}</td>
+            <td style="border-color:rgba(255,255,255,0.05);text-align:right;font-variant-numeric:tabular-nums">${c.peak === c.peakWeighted ? c.peak : c.peak + ' → ' + c.peakWeighted}</td>
           </tr>
           <tr class="history-detail-row" data-bucket="${escapeHtml(c.bucket)}" style="display:none">
             <td colspan="6" style="padding:0;border:none">
@@ -1099,7 +1151,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
                     <th class="history-detail-th" data-sortkey="tokensIn" style="border-color:rgba(255,255,255,0.05);font-weight:400;color:rgba(255,255,255,0.6);text-align:right;cursor:pointer;user-select:none">Tokens In${sortIcon('tokensIn')}</th>
                     <th class="history-detail-th" data-sortkey="tokensOut" style="border-color:rgba(255,255,255,0.05);font-weight:400;color:rgba(255,255,255,0.6);text-align:right;cursor:pointer;user-select:none">Tokens Out${sortIcon('tokensOut')}</th>
                     <th class="history-detail-th" data-sortkey="cachedRead" style="border-color:rgba(255,255,255,0.05);font-weight:400;color:rgba(255,255,255,0.6);text-align:right;cursor:pointer;user-select:none">Cache %${sortIcon('cachedRead')}</th>
-                    <th style="border-color:rgba(255,255,255,0.05)"></th>
+                    <th class="history-detail-th" data-sortkey="peak" style="border-color:rgba(255,255,255,0.05);font-weight:400;color:rgba(255,255,255,0.6);text-align:right;cursor:pointer;user-select:none">Peak${sortIcon('peak')}</th>
                   </tr></thead>
                   <tbody class="history-detail-tbody" data-models='${escapeHtml(JSON.stringify(modelEntries))}'>${renderModelRows(modelEntries)}</tbody>
                 </table>
@@ -1190,7 +1242,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(m.tokensIn)}</td>
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${formatCompact(m.tokensOut)}</td>
               <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${mCachePct}</td>
-              <td style="border-color:rgba(255,255,255,0.03)"></td>
+              <td style="border-color:rgba(255,255,255,0.03);text-align:right;font-variant-numeric:tabular-nums">${m.peak === m.peakWeighted ? m.peak : m.peak + ' → ' + m.peakWeighted}</td>
             </tr>`;
           }).join('');
           // Update sort icons on all headers in this table
@@ -1198,9 +1250,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
             const hKey = h.dataset.sortkey;
             const active = historyState.detailSort.key === hKey || (!historyState.detailSort.key && hKey === defaultKey);
             const dir = active ? (historyState.detailSort.key ? historyState.detailSort.dir : -1) : 0;
-            const label = h.textContent.replace(/[\s\u200b]+[\u25b4\u25be].*$/, '').trim() || h.textContent.split(' ')[0];
-            // Rebuild header text + icon
-            const textNode = h.firstChild;
+            // Rebuild header text + icon (strip old <i> caret elements, not unicode chars)
             const baseLabel = hKey === 'name' ? 'Model' : hKey === 'requests' ? 'Requests' : hKey === 'tokensIn' ? 'Tokens In' : hKey === 'tokensOut' ? 'Tokens Out' : 'Cache %';
             h.innerHTML = baseLabel + (active ? (dir < 0 ? ' <i class="bi bi-caret-down-fill" style="font-size:0.45rem"></i>' : ' <i class="bi bi-caret-up-fill" style="font-size:0.45rem"></i>') : '');
           });
@@ -1220,7 +1270,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       document.getElementById('histTotalRequests').textContent = formatCompact(totals.requests);
       document.getElementById('histCachedPct').textContent = totals.cachedPct.toFixed(1) + '%';
       document.getElementById('histErrorRate').textContent = totals.errorRate.toFixed(1) + '%';
-      document.getElementById('histPeakConc').textContent = totals.peakConc.toString();
+      document.getElementById('histPeakConc').textContent = totals.peakConc === totals.peakWeighted ? totals.peakConc.toString() : totals.peakConc.toString() + ' → ' + totals.peakWeighted.toString();
       document.getElementById('histTokensIn').textContent = formatCompact(totals.tokensIn);
       document.getElementById('histTokensOut').textContent = formatCompact(totals.tokensOut);
       renderHistoryChart(groups);
