@@ -4,19 +4,40 @@
 
 ```
 UMANS-DASH-GO/
-├── go.mod # Module: umans-dash-go, go 1.22, zero external deps
-├── main.go # Entry point (startup sequence, signal handling)
-├── dashboard.html # Dashboard UI (ported from JS proxy, minus excluded features)
-├── dashboard.js # Dashboard JavaScript (extracted, template-rendered)
-├── embed.go # go:embed wrapper for dashboard assets
-├── proxy/
-│ ├── types.go # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
-│ └── proxy.go # Full proxy implementation
-├── .cache/ # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
-│ ├── wallpaper.jpg # Cached Bing wallpaper (daily TTL)
-│ └── wallpaper-haven.jpg # Cached Wallhaven wallpaper (hourly TTL)
-├── .logs/ # HTTP error logs (auto-created, per-session rotating files)
-└── AGENTS.md # This file
+├── go.mod                # Module: umans-dash-go, go 1.22, zero external deps
+├── main.go               # Entry point (startup sequence, signal handling)
+├── src/                  # Proxy package (package proxy)
+│   ├── embed.go          # go:embed wrapper for dashboard assets
+│   ├── interface/
+│   │   ├── dashboard.html # Dashboard UI (ported from JS proxy, minus excluded features)
+│   │   └── dashboard.js   # Dashboard JavaScript (extracted, template-rendered)
+│   ├── config.go         # Constants, config loading/saving, env overrides
+│   ├── upstream.go       # UpstreamClient, HTTP calls to upstream API
+│   ├── keypool.go        # API key pool with cooldown/health tracking
+│   ├── cache.go          # ImageHandoffCache LRU, hash helpers
+│   ├── normalize.go      # Reasoning, tool schema, payload normalization
+│   ├── conversation.go   # Conversation tracking, fingerprinting
+│   ├── errors.go         # Header/body redaction
+│   ├── errors_log.go     # Error log file, HTTP error records
+│   ├── retry.go          # Retry loop, backoff presets
+│   ├── http.go           # HTTP helpers, SSE, error writers, auth
+│   ├── proxy_chat.go     # OpenAI chat completions proxy handler
+│   ├── proxy_anthropic.go # Anthropic messages proxy handler
+│   ├── queue.go          # Queue dispatch, concurrency limit mode
+│   ├── usage.go          # Usage/concurrency fetch, caching
+│   ├── handlers.go       # All HTTP handlers
+│   ├── wallpaper.go      # Wallpaper download/cache/serve
+│   ├── vision.go         # Vision handoff
+│   ├── dashboard.go      # Dashboard rendering
+│   ├── proxy.go          # NewProxy, ServeHTTP, Shutdown, lifecycle
+│   └── types.go          # Type definitions (Config, KeyPool, ImageHandoffCache, Proxy, etc.)
+├── screenshots/          # Dashboard screenshots
+├── .cache/               # Cached wallpaper images (auto-created) — `.jpg` extension but may contain PNG/WebP data
+│   ├── wallpaper.jpg     # Cached Bing wallpaper (daily TTL)
+│   └── wallpaper-haven.jpg # Cached Wallhaven wallpaper (hourly TTL)
+├── .logs/                # HTTP error logs (auto-created, per-session rotating files)
+├── .config/              # config.json (auto-created, gitignored)
+└── AGENTS.md             # This file
 ```
 
 ## What This Project Is
@@ -25,10 +46,10 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 
 ## Current State
 
-- **`proxy/proxy.go` + `proxy/types.go`** contain the full implementation of all proxy functions.
-- **`dashboard.html`** is the dashboard UI, ported from the JS proxy minus excluded features (see "Excluded from Original" below).
+- **`src/`** contains the full proxy implementation, split across ~20 files by concern (config, upstream client, key pool, queue, handlers, etc.). See the Project Structure above for the file map.
+- **`src/interface/dashboard.html`** is the dashboard UI, ported from the JS proxy minus excluded features (see "Excluded from Original" below).
 
-## Key Types (proxy/types.go)
+## Key Types (src/types.go)
 
 | Type | Purpose |
 |---|---|
@@ -43,7 +64,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 | `ConcurrencyData` | Concurrency limits and current state |
 | `ImagePart` | An image found in a request payload (for vision handoff) |
 
-## Key Functions (proxy/proxy.go)
+## Key Functions (src/)
 
 ### Config
 - `ParseDuration(str string) Duration` — Parse `"15m"`, `"6h"`, `"30s"`; bare numbers (pure digits) interpreted as **milliseconds**
@@ -116,7 +137,7 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) getSlotFreeDelay() int` — reads `Config.SlotFreeDelay` under `configMu.RLock`
 - `(*Proxy) gateLimit() int` — returns the effective concurrency gate based on mode: `soft` → soft cap (`Limit`), `hard` → hard cap (`HardCap`) if available else `Limit`, `manual` → `ManualConcurrencyLimit` clamped to `[1, HardCap]` (falls back to soft cap if `ManualConcurrencyLimit` is 0/uninitialized); returns `-1` if no gate applies. Snapshots `OverrideConcurrency` under `configMu.RLock`, then calls `GetEffectiveConcurrency(lastConcurrency, override)` (which takes `override` as a parameter — no longer reads `configMu` internally — to avoid recursive locking when called from `HandleConfigPost` or `gateLimit`).
 - `Config.ConcurrencyLimitMode` (JSON `CONCURRENCY_LIMIT_MODE`) and `Config.ManualConcurrencyLimit` (JSON `MANUAL_CONCURRENCY_LIMIT`) persisted via `saveConfig()`; restored in `NewProxy()` on startup. Old `BURST_MODE` bool migrated: `true` → `"hard"`, `false`/missing → `"soft"`. `BurstMode` kept in sync (`true` when mode is `"hard"`) for rollback safety.
-- `Config.SlotFreeDelay` (JSON `SLOT_FREE_DELAY`) — delay in seconds before `OnRequestComplete()` decrements `ActiveRequests`. Default 0 (immediate).
+- `Config.SlotFreeDelay` (JSON `SLOT_FREE_DELAY`) — delay in seconds before `OnRequestComplete()` decrements `ActiveRequests`. Default 2.
 - `HandleConfigPost` calls `signalQueue()` on any mode change (not just `hard`/`manual`) since switching to `soft` from a more restrictive mode can also raise the gate. The call happens **after** `configMu.Unlock()` to avoid lock-order inversion. When switching to `manual` with `manualLimit == 0`, initializes it to the current soft cap (or hard cap if no soft cap).
 
 ### Retry Config & Backoff
@@ -207,12 +228,12 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) HandleBingWallpaper(w, r)` — daily cache; calls `upgradePeapixResolution()` for UHD variant
 - `(*Proxy) HandleWallhavenWallpaper(w, r)` — hourly cache; `atleast=2560x1440` filter; uses `isValidImage` + `serveWallpaperImageTyped` with `imageContentType`
 
-### Dashboard (dashboard.html)
+### Dashboard (src/interface/dashboard.html)
 - **Concurrency Limit selector** — three-button group (Soft Cap / Hard Cap / Manual) replacing the old Burst Mode On/Off toggle. Soft Cap gates at the soft cap (Limit), Hard Cap gates at the hard cap (HardCap), Manual reveals a slider (1 to hard cap) for a custom concurrency limit. Frontend POSTs `concurrencyLimitMode` and `manualConcurrencyLimit` to `/api/config`; `loadConfig()` initializes the state from backend; `fetchConcurrency()` reads `concurrency_limit_mode` and `manual_limit` from the concurrency API response and dynamically updates the slider max/position
-- **Slot Free Delay input** — number input in Quick Settings for a positive integer (seconds, default 0). POSTs `slotFreeDelay` to `/api/config` on change
+- **Slot Free Delay slider** — range slider (0–60s, default 2) in Quick Settings. POSTs `slotFreeDelay` to `/api/config` on change. Shows live value.
+- **Request Timeout slider** — range slider (30s–30m, step 30s, default 15m) in Quick Settings. POSTs `requestTimeout` (seconds) to `/api/config` on change. Applied live via `Upstream.SetTimeout()` without restart. Positioned above Retry Attempts.
 - **Retry Attempts slider** — range slider (0–10, default 2) in Quick Settings. POSTs `retryAttempts` to `/api/config` on change. Shows live value.
 - **Backoff Strategy dropdown** — select in Quick Settings (hidden when retries=0). Options: Aggressive (1s→60s) or Conservative (5s→300s). POSTs `backoffStrategy` to `/api/config` on change. Shows delay sequence preview below.
-- **Request Timeout slider** — range slider (30s–30m, step 30s, default 15m) in Quick Settings. POSTs `requestTimeout` (seconds) to `/api/config` on change. Applied live via `Upstream.SetTimeout()` without restart.
 - **Priority card** — replaces the old Throttled card in the usage stat grid. Always visible. Shows "Low (reason)" in yellow when priority is low, "Normal" in white otherwise.
 - **Collapsed-by-default sections** — Quick Actions, Models, and Environment sections start collapsed (have `collapsed` class in HTML). Other sections (Quick Settings, Usage History, etc.) start expanded.
 - **Environment section** — shows Version (from `proxyData.version`), Runtime (Go version), Port, and Started At. The collapsed header preview text shows `v{version} · {runtime} · :{port}`.

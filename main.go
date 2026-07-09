@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	proxy "umans-dash-go/proxy"
+	proxy "umans-dash-go/src"
 )
 
 const (
@@ -34,8 +34,8 @@ func main() {
 	// Step 2: Create Proxy (runs §31 steps 2-7 inside NewProxy)
 	p := proxy.NewProxy(&cfg)
 	p.Version = Version
-	p.DashboardHTML = dashboardHTML
-	p.DashboardJS = dashboardJS
+	p.DashboardHTML = proxy.DashboardHTML
+	p.DashboardJS = proxy.DashboardJS
 
 	// Step 3: Parse listen address
 	listenAddr := cfg.ListenAddr

@@ -37,30 +37,30 @@ type KeyState struct {
 
 // Config holds all runtime configuration for the proxy.
 type Config struct {
-	ListenAddr           string            `json:"LISTEN_ADDR"`
-	UpstreamBaseURL      string            `json:"UPSTREAM_BASE_URL"`
-	RequestTimeout       Duration          `json:"REQUEST_TIMEOUT"`
-	APIKey               string            `json:"API_KEY"`
-	APIKeys              []string          `json:"API_KEYS"`
-	Keys                 []KeyConfig       `json:"KEYS"`
-	EnabledModels        []string          `json:"ENABLED_MODELS"`
-	ModelDisplayNames    map[string]string `json:"MODEL_DISPLAY_NAMES"`
-	OverrideConcurrency     int               `json:"OVERRIDE_CONCURRENCY"`
-	MaxImages               int               `json:"MAX_IMAGES"`
-	DisabledModels          []string          `json:"DISABLED_MODELS"`
-	VisionHandoffEnabled    bool              `json:"VISION_HANDOFF_ENABLED"`
-	VisionHandoffModel      string            `json:"VISION_HANDOFF_MODEL"`
-	VisionHandoffPrompt     string            `json:"VISION_HANDOFF_PROMPT"`
-	VisionHandoffCacheEnabled bool           `json:"VISION_HANDOFF_CACHE_ENABLED"`
-	VisionHandoffCacheTtl   Duration          `json:"VISION_HANDOFF_CACHE_TTL"`
-	VisionHandoffConcurrency int              `json:"VISION_HANDOFF_CONCURRENCY"`
-	WallpaperSource         string            `json:"wallpaperSource"`
-	ApiKeyMode              string            `json:"API_KEY_MODE"` // "smart" (default), "managed", or "passthrough"
+	ListenAddr                string            `json:"LISTEN_ADDR"`
+	UpstreamBaseURL           string            `json:"UPSTREAM_BASE_URL"`
+	RequestTimeout            Duration          `json:"REQUEST_TIMEOUT"`
+	APIKey                    string            `json:"API_KEY"`
+	APIKeys                   []string          `json:"API_KEYS"`
+	Keys                      []KeyConfig       `json:"KEYS"`
+	EnabledModels             []string          `json:"ENABLED_MODELS"`
+	ModelDisplayNames         map[string]string `json:"MODEL_DISPLAY_NAMES"`
+	OverrideConcurrency       int               `json:"OVERRIDE_CONCURRENCY"`
+	MaxImages                 int               `json:"MAX_IMAGES"`
+	DisabledModels            []string          `json:"DISABLED_MODELS"`
+	VisionHandoffEnabled      bool              `json:"VISION_HANDOFF_ENABLED"`
+	VisionHandoffModel        string            `json:"VISION_HANDOFF_MODEL"`
+	VisionHandoffPrompt       string            `json:"VISION_HANDOFF_PROMPT"`
+	VisionHandoffCacheEnabled bool              `json:"VISION_HANDOFF_CACHE_ENABLED"`
+	VisionHandoffCacheTtl     Duration          `json:"VISION_HANDOFF_CACHE_TTL"`
+	VisionHandoffConcurrency  int               `json:"VISION_HANDOFF_CONCURRENCY"`
+	WallpaperSource           string            `json:"wallpaperSource"`
+	ApiKeyMode                string            `json:"API_KEY_MODE"` // "smart" (default), "managed", or "passthrough"
 	// ConcurrencyLimitMode controls which cap gates concurrency:
 	//   "soft"   → gate at Limit (soft cap)        [default, same as old BurstMode=false]
 	//   "hard"   → gate at HardCap (hard cap)       [same as old BurstMode=true]
 	//   "manual" → gate at ManualConcurrencyLimit   [user-specified via slider]
-	ConcurrencyLimitMode  string `json:"CONCURRENCY_LIMIT_MODE"`
+	ConcurrencyLimitMode string `json:"CONCURRENCY_LIMIT_MODE"`
 	// ManualConcurrencyLimit is the user-chosen gate value when mode == "manual".
 	// Default 0 = uninitialized; gateLimit() falls back to soft cap.
 	ManualConcurrencyLimit int `json:"MANUAL_CONCURRENCY_LIMIT"`
@@ -149,12 +149,12 @@ type ModelInfo struct {
 
 // Capabilities describes what a model supports.
 type Capabilities struct {
-	ContextWindow          interface{} `json:"context_window"`
-	RecommendedMaxTokens   interface{} `json:"recommended_max_tokens"`
-	MaxCompletionTokens    interface{} `json:"max_completion_tokens"`
-	SupportsTools          interface{} `json:"supports_tools"`
-	SupportsVision         interface{} `json:"supports_vision"`
-	Reasoning              interface{} `json:"reasoning"`
+	ContextWindow        interface{} `json:"context_window"`
+	RecommendedMaxTokens interface{} `json:"recommended_max_tokens"`
+	MaxCompletionTokens  interface{} `json:"max_completion_tokens"`
+	SupportsTools        interface{} `json:"supports_tools"`
+	SupportsVision       interface{} `json:"supports_vision"`
+	Reasoning            interface{} `json:"reasoning"`
 }
 
 // Pricing holds per-million-token pricing for a model.
@@ -194,12 +194,12 @@ type PlanInfo struct {
 // The upstream /usage endpoint returns additional fields beyond usage/window/plan
 // that are needed by fetchConcurrency() (§6.2).
 type UsageData struct {
-	Usage              UsageInfo     `json:"usage"`
+	Usage              UsageInfo    `json:"usage"`
 	Window             *WindowInfo  `json:"window"`
-	Plan               PlanInfo      `json:"plan"`
-	ConcurrentSessions int           `json:"concurrent_sessions"` // §6.2
-	Limits             *UsageLimits  `json:"limits"`              // §6.2
-	UserID             string        `json:"user_id"`             // §6.2/A1
+	Plan               PlanInfo     `json:"plan"`
+	ConcurrentSessions int          `json:"concurrent_sessions"` // §6.2
+	Limits             *UsageLimits `json:"limits"`              // §6.2
+	UserID             string       `json:"user_id"`             // §6.2/A1
 }
 
 // UsageLimits holds concurrency limits from the upstream /usage response.
@@ -322,9 +322,9 @@ type QueueItem struct {
 	WritePassthroughError PassthroughErrorWriter
 	Format                string
 	Req                   *http.Request
-	Fingerprint           string // conversation fingerprint for session affinity
-	PreferredKeyIndex     int    // -1 = no preference, ≥0 for specific key
-	IsStream              bool   // whether this is a streaming request
+	Fingerprint           string        // conversation fingerprint for session affinity
+	PreferredKeyIndex     int           // -1 = no preference, ≥0 for specific key
+	IsStream              bool          // whether this is a streaming request
 	Done                  chan struct{} // closed by runDispatch when the request completes
 }
 
@@ -344,12 +344,12 @@ type HttpErrorRecord struct {
 	RequestMethod  string              `json:"requestMethod"`
 	RequestURL     string              `json:"requestUrl"`
 	RequestHeaders map[string][]string `json:"requestHeaders"` // already redacted
-	RequestBody    string              `json:"requestBody"`     // already redacted
+	RequestBody    string              `json:"requestBody"`    // already redacted
 
 	// Upstream details (from the proxied request to the upstream API)
 	UpstreamURL        string              `json:"upstreamUrl"`
 	UpstreamMethod     string              `json:"upstreamMethod"`
-	UpstreamHeaders    map[string][]string `json:"upstreamHeaders"`    // already redacted
+	UpstreamHeaders    map[string][]string `json:"upstreamHeaders"` // already redacted
 	UpstreamStatus     int                 `json:"upstreamStatus"`
 	UpstreamStatusText string              `json:"upstreamStatusText"`
 	UpstreamBody       string              `json:"upstreamBody"` // already redacted
@@ -472,51 +472,51 @@ func (sf *catalogSingleflight) Do(key string, fn func() (interface{}, error)) (i
 // During implementation, all state (config, key pool, cache, model catalog, etc.)
 // will live as fields on this struct.
 type Proxy struct {
-	Config          *Config
-	Upstream        *UpstreamClient
-	KeyPool         *KeyPool
+	Config            *Config
+	Upstream          *UpstreamClient
+	KeyPool           *KeyPool
 	ImageHandoffCache *ImageHandoffCache
-	StartedAt       time.Time
-	Version         string
-	DashboardHTML   []byte // embedded dashboard.html (template source)
-	DashboardJS     []byte // embedded dashboard.js (template source)
-	dashMu          sync.Mutex
-	dashRendered    []byte // cached rendered HTML
-	dashJsRendered  []byte // cached rendered JS
-	ModelInfoMap    map[string]ModelInfo
-	DisplayNameMap  map[string]string
+	StartedAt         time.Time
+	Version           string
+	DashboardHTML     []byte // embedded dashboard.html (template source)
+	DashboardJS       []byte // embedded dashboard.js (template source)
+	dashMu            sync.Mutex
+	dashRendered      []byte // cached rendered HTML
+	dashJsRendered    []byte // cached rendered JS
+	ModelInfoMap      map[string]ModelInfo
+	DisplayNameMap    map[string]string
 	UpstreamPricing   map[string]Pricing
-	HandoffResponse  string
+	HandoffResponse   string
 
 	// Runtime state for usage/concurrency (set by tests, populated by real impl)
-	UsageData         *UsageData
-	ThrottledCount    int
-	ThrottledWindow   string
-	ActiveRequests    int
-	QueueLen          int
+	UsageData       *UsageData
+	ThrottledCount  int
+	ThrottledWindow string
+	ActiveRequests  int
+	QueueLen        int
 	// Concurrency queue (§5)
-	queueMu      sync.RWMutex
-	queueCond    *sync.Cond // sync.NewCond(&p.queueMu) — RWMutex satisfies sync.Locker
-	requestQueue []*QueueItem
-	queuePending bool          // true when a ProcessQueue pass is scheduled
-	queueDone    chan struct{} // closed during shutdown
-	workerWG     sync.WaitGroup
-	queueShutdownOnce sync.Once // guards close(queueDone)
+	queueMu           sync.RWMutex
+	queueCond         *sync.Cond // sync.NewCond(&p.queueMu) — RWMutex satisfies sync.Locker
+	requestQueue      []*QueueItem
+	queuePending      bool          // true when a ProcessQueue pass is scheduled
+	queueDone         chan struct{} // closed during shutdown
+	workerWG          sync.WaitGroup
+	queueShutdownOnce sync.Once     // guards close(queueDone)
 	visionHandoffSem  chan struct{} // proxy-wide vision-handoff concurrency limit (nil if disabled)
 
 	// Catalog maps (§8) — protects ModelInfoMap and DisplayNameMap
-	catalogMu sync.RWMutex
-	LastConcurrency   ConcurrencyData
+	catalogMu       sync.RWMutex
+	LastConcurrency ConcurrencyData
 	// §6.1: usage cache (5-min TTL)
-	usageCache            *UsageData
-	usageCacheFetchedAt   time.Time
+	usageCache          *UsageData
+	usageCacheFetchedAt time.Time
 	// §6.1: usage history cache (5-min TTL)
-	usageHistoryCache     *usageHistoryCacheEntry
+	usageHistoryCache *usageHistoryCacheEntry
 	// §6.3: effective concurrency cache (invalidated by fetchConcurrency)
 	effectiveConcurrencyCache *ConcurrencyData
 
 	// Cache fields for §8 Model Catalog
-	mu                  sync.RWMutex
+	mu sync.RWMutex
 
 	// Config read/write lock (§25)
 	configMu            sync.RWMutex
@@ -569,9 +569,9 @@ type Proxy struct {
 	shuttingDown atomic.Bool
 
 	// §6.4 cached gate limit
-	cachedGate      int
-	cachedGateAt    time.Time
-	cachedGateMu    sync.RWMutex
+	cachedGate   int
+	cachedGateAt time.Time
+	cachedGateMu sync.RWMutex
 
 	// §7.3 wallpaper CSS cache
 	wallpaperCssMu  sync.RWMutex
@@ -589,11 +589,11 @@ type Proxy struct {
 // the response is already in flight (e.g., SSE streaming).
 type responseWriterTracker struct {
 	http.ResponseWriter
-	mu         sync.Mutex
-	written    bool            // true once WriteHeader or Write is called
-	hijacked   bool            // true after middleware takes over the response
-	aborted    bool            // set by timeout middleware; writer methods become no-ops
-	clientCtx  context.Context // original client context (not the timeout-wrapped one)
+	mu        sync.Mutex
+	written   bool            // true once WriteHeader or Write is called
+	hijacked  bool            // true after middleware takes over the response
+	aborted   bool            // set by timeout middleware; writer methods become no-ops
+	clientCtx context.Context // original client context (not the timeout-wrapped one)
 }
 
 func (rw *responseWriterTracker) WriteHeader(code int) {

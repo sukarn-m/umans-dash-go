@@ -31,13 +31,38 @@ This is a Go port and opinionated customization of the original Node.js project 
 
 ```
 umans-dash-go/
-├── main.go            # Entry point (config load, HTTP server, graceful shutdown)
-├── proxy/
-│   ├── proxy.go       # Full proxy implementation (handlers, upstream client, queues, caching)
-│   └── types.go       # Type definitions (Config, KeyPool, Proxy, etc.)
-├── dashboard.html     # Dashboard UI
-├── go.mod             # Go module definition (stdlib only)
-└── AGENTS.md          # Developer guide
+├── main.go                # Entry point (config load, HTTP server, graceful shutdown)
+├── go.mod                 # Go module definition (stdlib only)
+├── src/                   # Proxy package (package proxy)
+│   ├── embed.go           # go:embed wrapper for dashboard assets
+│   ├── interface/
+│   │   ├── dashboard.html # Dashboard UI
+│   │   └── dashboard.js   # Dashboard JavaScript (template-rendered)
+│   ├── config.go          # Constants, config loading/saving, env overrides
+│   ├── upstream.go        # UpstreamClient, HTTP calls to upstream API
+│   ├── keypool.go         # API key pool with cooldown/health tracking
+│   ├── cache.go           # ImageHandoffCache LRU, hash helpers
+│   ├── normalize.go       # Reasoning, tool schema, payload normalization
+│   ├── conversation.go    # Conversation tracking, fingerprinting
+│   ├── errors.go          # Header/body redaction
+│   ├── errors_log.go      # Error log file, HTTP error records
+│   ├── retry.go           # Retry loop, backoff presets
+│   ├── http.go            # HTTP helpers, SSE, error writers, auth
+│   ├── proxy_chat.go      # OpenAI chat completions proxy handler
+│   ├── proxy_anthropic.go # Anthropic messages proxy handler
+│   ├── queue.go           # Queue dispatch, concurrency limit mode
+│   ├── usage.go           # Usage/concurrency fetch, caching
+│   ├── handlers.go        # All HTTP handlers
+│   ├── wallpaper.go       # Wallpaper download/cache/serve
+│   ├── vision.go          # Vision handoff
+│   ├── dashboard.go       # Dashboard rendering
+│   ├── proxy.go           # NewProxy, ServeHTTP, Shutdown, lifecycle
+│   └── types.go           # Type definitions (Config, KeyPool, Proxy, etc.)
+├── screenshots/           # Dashboard screenshots
+├── .cache/                # Cached wallpaper images (auto-created)
+├── .logs/                 # HTTP error logs (auto-created)
+├── .config/               # config.json (auto-created, gitignored)
+└── AGENTS.md              # Developer guide
 ```
 
 ## Differences from the Original Node.js Version
@@ -208,10 +233,11 @@ Open **http://127.0.0.1:8084** in your browser.
 ### Usage History Card
 - Bar chart with Y-axis labels, dashed grid lines, and X-axis labels
 - Click a bar to filter the table to that date
-- Table shows consolidated per-date rows (Date, Requests, Tokens In, Tokens Out, Cache %, Peak) with sortable headers
-- Click a row to expand a per-model detail table (Model, Requests, Tokens In, Tokens Out, Cache %) with its own sortable headers
+- Table shows consolidated per-date rows (Date, Requests, Tokens In, Tokens Out, Cache %, Peak) with sortable headers. Peak shows `peak → weighted peak` with an arrow (same as Requests)
+- Click a row to expand a per-model detail table (Model, Requests, Tokens In, Tokens Out, Cache %, Peak) with its own sortable headers
 - Metric toggle (Tokens/Requests) controls chart scale and default sort
 - Status legend shown only in Requests mode; hidden in Tokens mode
+- **Client-side cache** — 30d of data is fetched once per granularity and cached for 5 minutes. Switching between 24h, 7d, and 30d ranges is instant (client-side date filtering, no upstream call)
 
 ### API Key (collapsed by default)
 - Key pool display with status badges; manage keys via modal
@@ -221,7 +247,8 @@ Open **http://127.0.0.1:8084** in your browser.
 - **Automatic Refresh** — 30s / 1m / 2m / 5m (=298s) interval selector; persisted to `localStorage`
 - **Wallpaper** — None / Bing / Wallhaven
 - **Concurrency Limit** — Soft Cap / Hard Cap / Manual selector. Manual reveals a slider (1 to hard cap) for a custom concurrency limit. Persisted in config (`CONCURRENCY_LIMIT_MODE`, `MANUAL_CONCURRENCY_LIMIT`)
-- **Slot Free Delay** — Positive integer (seconds, default 0) that delays freeing a concurrency slot after a request completes. Persisted in config (`SLOT_FREE_DELAY`)
+- **Slot Free Delay** — Slider (0–60s, default 2) that delays freeing a concurrency slot after a request completes. Persisted in config (`SLOT_FREE_DELAY`)
+- **Request Timeout** — Slider (30s–30m, default 15m) for upstream request timeout, applied live without restart. Positioned above Retry Attempts
 - **API Key** — Smart / Managed / Pass-Through mode selector
 - **Vision Handoff** — Toggle image handoff for vision-incapable models
 - **Handoff Cache** — Toggle caching of vision handoff image analyses (shown only when Vision Handoff is enabled)
@@ -337,7 +364,7 @@ The built-in prompt instructs the handoff model to produce a factual, third-pers
 | `API_KEY_MODE` | API key selection mode: `smart`, `managed`, or `passthrough` | `smart` |
 | `CONCURRENCY_LIMIT_MODE` | Concurrency gating mode: `soft` (soft cap), `hard` (hard cap), or `manual` (custom via slider) | `soft` |
 | `MANUAL_CONCURRENCY_LIMIT` | Custom concurrency limit when mode is `manual` (0 = auto-initialize to soft cap on first use) | `0` |
-| `SLOT_FREE_DELAY` | Delay in seconds before freeing a concurrency slot after a request completes (0 = immediate) | `0` |
+| `SLOT_FREE_DELAY` | Delay in seconds before freeing a concurrency slot after a request completes (0 = immediate) | `2` |
 | `BURST_MODE` | Deprecated. Kept for config migration + rollback safety. `true` when mode is `hard`, `false` otherwise | `false` |
 
 ## Building and Development
