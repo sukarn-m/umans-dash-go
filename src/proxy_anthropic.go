@@ -96,15 +96,20 @@ func (p *Proxy) proxyAnthropicRequest(item *QueueItem) {
 	// STEP 4: Normalize thinking payload (§20.4)
 	NormalizeThinkingPayload(payload)
 
-	// STEP 5: Limit images (§20.3)
-	LimitImagesInMessages(payload, cfgMaxImages)
-
-	// STEP 5b: Model resolution (same as OpenAI path)
+	// STEP 5: Model resolution (same as OpenAI path)
 	resolvedModel := p.ResolveModelId(model)
 	payload["model"] = resolvedModel
 
+	// STEP 5b: Limit images (§20.3) — only when NOT doing vision handoff,
+	// mirroring the OpenAI path. When handoff is active, images must be
+	// preserved so CollectImageParts can find and process them.
+	needsHandoff := p.NeedsVisionHandoff(resolvedModel)
+	if !needsHandoff {
+		LimitImagesInMessages(payload, cfgMaxImages)
+	}
+
 	// STEP 6: Vision handoff (§20.5, §11)
-	if p.NeedsVisionHandoff(resolvedModel) {
+	if needsHandoff {
 		if isStream {
 			p.FlushVisionHandoffKeepalive(w)
 		}

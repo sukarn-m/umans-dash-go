@@ -465,9 +465,9 @@ func (p *Proxy) ValidateApiKey() bool {
 
 func (p *Proxy) NeedsVisionHandoff(resolvedModel string) bool {
 	p.configMu.RLock()
-	defer p.configMu.RUnlock()
-
-	if !p.Config.VisionHandoffEnabled {
+	enabled := p.Config.VisionHandoffEnabled
+	p.configMu.RUnlock()
+	if !enabled {
 		return false
 	}
 	p.catalogMu.RLock()
@@ -560,7 +560,10 @@ func CollectImageParts(payload map[string]interface{}) []ImagePart {
 
 // cacheHandoffDescription stores a description in the handoff cache if enabled.
 func (p *Proxy) cacheHandoffDescription(dataURI, desc string) {
-	if p.Config.VisionHandoffCacheEnabled && p.ImageHandoffCache != nil {
+	p.configMu.RLock()
+	cacheEnabled := p.Config.VisionHandoffCacheEnabled
+	p.configMu.RUnlock()
+	if cacheEnabled && p.ImageHandoffCache != nil {
 		hash := sha256Hash(dataURI)
 		p.ImageHandoffCache.Set(hash, desc)
 	}
@@ -570,15 +573,20 @@ func (p *Proxy) cacheHandoffDescription(dataURI, desc string) {
 // returns a text description. It makes a non-streaming chatCompletions call
 // with the image as an image_url content part (SPEC §11.4).
 func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffModel, apiKey string) string {
-	// Check handoff cache first (§11.4)
-	if p.Config.VisionHandoffCacheEnabled && p.ImageHandoffCache != nil {
+	// Check handoff cache first (§11.4) — snapshot config under lock to avoid
+	// data races with HandleConfigPost.
+	p.configMu.RLock()
+	cacheEnabled := p.Config.VisionHandoffCacheEnabled
+	systemPrompt := p.Config.VisionHandoffPrompt
+	p.configMu.RUnlock()
+
+	if cacheEnabled && p.ImageHandoffCache != nil {
 		hash := sha256Hash(dataURI)
 		if cached, ok := p.ImageHandoffCache.Get(hash); ok {
 			return cached
 		}
 	}
 
-	systemPrompt := p.Config.VisionHandoffPrompt
 	if systemPrompt == "" {
 		systemPrompt = DEFAULT_VISION_HANDOFF_PROMPT
 	}

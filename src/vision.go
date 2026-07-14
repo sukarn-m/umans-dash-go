@@ -24,8 +24,15 @@ func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]int
 		return 0
 	}
 
-	// 4.3: Cap image parts to avoid excessive handoff calls.
-	maxImages := p.getVisionHandoffLimit()
+	// Snapshot config fields under configMu.RLock to avoid data races with
+	// HandleConfigPost (which writes under configMu.Lock).
+	p.configMu.RLock()
+	maxImages := p.Config.MaxImages
+	handoffModel := p.Config.VisionHandoffModel
+	p.configMu.RUnlock()
+
+	// Cap image parts to avoid excessive handoff calls. Use MaxImages (the
+	// same field used by LimitImagesInMessages). Fall back to 4 if unset.
 	if maxImages <= 0 {
 		maxImages = 4
 	}
@@ -33,7 +40,6 @@ func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]int
 		parts = parts[:maxImages]
 	}
 
-	handoffModel := p.Config.VisionHandoffModel
 	if handoffModel == "" {
 		handoffModel = "umans-coder"
 	}
@@ -61,7 +67,7 @@ func (p *Proxy) PerformVisionHandoff(ctx context.Context, payload map[string]int
 				return
 			}
 			if p.Upstream == nil {
-				descriptions[idx] = p.HandoffResponse
+				descriptions[idx] = "[Image analysis unavailable: upstream not configured]"
 				return
 			}
 			descriptions[idx] = p.analyzeImageViaHandoff(ctx, dataURI, handoffModel, apiKey)

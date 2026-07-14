@@ -65,6 +65,12 @@ func (p *Proxy) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	// models_count
 	modelsCount := len(p.GetEffectiveModels())
 
+	// Vision handoff config (read under configMu.RLock to avoid races)
+	p.configMu.RLock()
+	vhEnabled := p.Config.VisionHandoffEnabled
+	vhCacheEnabled := p.Config.VisionHandoffCacheEnabled
+	p.configMu.RUnlock()
+
 	// Vision handoff cache stats
 	var handoffStats HandoffCacheStats
 	if p.ImageHandoffCache != nil {
@@ -86,8 +92,8 @@ func (p *Proxy) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		"version":         p.Version,
 		"port":            ParseListenPort(p.Config.ListenAddr),
 		"visionHandoff": map[string]interface{}{
-			"enabled":      p.Config.VisionHandoffEnabled,
-			"cacheEnabled": p.Config.VisionHandoffCacheEnabled,
+			"enabled":      vhEnabled,
+			"cacheEnabled": vhCacheEnabled,
 			"cache": map[string]interface{}{
 				"size":      handoffStats.Size,
 				"maxSize":   handoffStats.MaxSize,
