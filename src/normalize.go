@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -570,8 +573,14 @@ func (p *Proxy) cacheHandoffDescription(dataURI, desc string) {
 }
 
 // analyzeImageViaHandoff sends a single image to the vision handoff model and
-// returns a text description. It makes a non-streaming chatCompletions call
+// returns a text description. It makes a streaming chatCompletions call
 // with the image as an image_url content part (SPEC §11.4).
+//
+// Streaming is used instead of non-streaming to avoid upstream context
+// cancellation on long-running vision requests. The upstream provider
+// (api.code.umans.ai) cancels non-streaming contexts after ~90-120s, which
+// causes 502 "context canceled" errors on large images. Streaming keeps
+// the connection alive and avoids this timeout.
 func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffModel, apiKey string) string {
 	// Check handoff cache first (§11.4) — snapshot config under lock to avoid
 	// data races with HandleConfigPost.
@@ -593,7 +602,7 @@ func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffMode
 
 	handoffReq := map[string]interface{}{
 		"model":  handoffModel,
-		"stream": false,
+		"stream": true,
 		"messages": []interface{}{
 			map[string]interface{}{
 				"role":    "system",
@@ -622,7 +631,7 @@ func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffMode
 		return fmt.Sprintf("[Image analysis failed: failed to marshal request: %s]", err.Error())
 	}
 
-	resp, err := p.Upstream.ChatCompletions(ctx, bodyBytes, false, apiKey)
+	resp, err := p.Upstream.ChatCompletions(ctx, bodyBytes, true, apiKey)
 	if err != nil {
 		return fmt.Sprintf("[Image analysis failed: upstream request error: %s]", err.Error())
 	}
@@ -633,51 +642,73 @@ func (p *Proxy) analyzeImageViaHandoff(ctx context.Context, dataURI, handoffMode
 		return fmt.Sprintf("[Image analysis failed: upstream returned status %d: %s]", resp.StatusCode, bodyText)
 	}
 
-	var respData map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
-		return fmt.Sprintf("[Image analysis failed: failed to decode response: %s]", err.Error())
+	// Parse SSE stream and accumulate content from delta chunks.
+	var contentBuilder strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		choices, ok := chunk["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
+			continue
+		}
+		firstChoice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		delta, ok := firstChoice["delta"].(map[string]interface{})
+		if !ok {
+			// Non-streaming-style response (message instead of delta) —
+			// fall back to extracting from message.content.
+			if msg, ok := firstChoice["message"].(map[string]interface{}); ok {
+				extractContent(msg["content"], &contentBuilder)
+			}
+			continue
+		}
+		extractContent(delta["content"], &contentBuilder)
 	}
 
-	choices, ok := respData["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
-		return "[Image analysis failed: no choices in response]"
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Sprintf("[Image analysis failed: error reading SSE stream: %s]", err.Error())
 	}
-	firstChoice, ok := choices[0].(map[string]interface{})
-	if !ok {
-		return "[Image analysis failed: invalid choice format]"
-	}
-	message, ok := firstChoice["message"].(map[string]interface{})
-	if !ok {
-		return "[Image analysis failed: no message in choice]"
-	}
-	content := message["content"]
 
+	desc := contentBuilder.String()
+	if desc == "" {
+		return "[Image analysis failed: empty content from stream]"
+	}
+
+	p.cacheHandoffDescription(dataURI, desc)
+	return desc
+}
+
+// extractContent appends text from a streaming delta content field to the
+// provided builder. Content can be a string or an array of content parts
+// (each with type "text" and a "text" field).
+func extractContent(content interface{}, builder *strings.Builder) {
 	switch c := content.(type) {
 	case string:
-		if c == "" {
-			return "[Image analysis failed: empty content]"
-		}
-		p.cacheHandoffDescription(dataURI, c)
-		return c
+		builder.WriteString(c)
 	case []interface{}:
-		var sb strings.Builder
 		for _, part := range c {
 			if p, ok := part.(map[string]interface{}); ok {
 				if t, _ := p["type"].(string); t == "text" {
 					if text, ok := p["text"].(string); ok {
-						sb.WriteString(text)
+						builder.WriteString(text)
 					}
 				}
 			}
 		}
-		if sb.Len() == 0 {
-			return "[Image analysis failed: no text content in response array]"
-		}
-		desc := sb.String()
-		p.cacheHandoffDescription(dataURI, desc)
-		return desc
-	default:
-		return "[Image analysis failed: unexpected content type]"
 	}
 }
 
