@@ -176,11 +176,17 @@ func (u *UpstreamClient) doPost(ctx context.Context, path string, body []byte, i
 	var cancel context.CancelFunc
 	if !isStream && timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+		// Do NOT defer cancel() — the caller must read resp.Body after this
+		// function returns, and a deferred cancel would fire immediately on
+		// return, canceling the context before the body is read. The
+		// cancelOnClose wrapper below calls cancel() when the body is closed.
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.baseURL+path, bytes.NewReader(body))
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, fmt.Errorf("%s: creating request: %w", path, err)
 	}
 
@@ -195,6 +201,9 @@ func (u *UpstreamClient) doPost(ctx context.Context, path string, body []byte, i
 
 	resp, err := u.httpClient.Do(req)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, fmt.Errorf("%s: executing request: %w", path, err)
 	}
 

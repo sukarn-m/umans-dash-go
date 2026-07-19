@@ -21,7 +21,7 @@ const (
 	portRetryDelay    = 2 * time.Second
 	maxPortIncrements = 10
 
-	Version = "1.4.1"
+	Version = "1.4.2"
 )
 
 func main() {
