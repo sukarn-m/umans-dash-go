@@ -385,13 +385,44 @@
 
     <div class="row">
       <div class="col-lg-8">
+        <div class="card" data-glass data-section="limits">
+          <div class="glass-panel"></div>
+          <div class="card-content">
+            <div class="card-header collapsible-header d-flex justify-content-between align-items-center" role="button" tabindex="0" aria-expanded="true" onclick="toggleSection('limits')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSection('limits')}">
+              <span><i class="bi bi-chevron-down toggle-icon me-1"></i><i class="bi bi-sliders me-2"></i><span>Usage Limits</span></span>
+            </div>
+            <div class="card-body collapse-section" id="section-limits">
+              <div id="serviceModeBanner" style="display:none;margin:0 0 12px;padding:10px 16px;border-radius:12px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)">
+                <div class="d-flex align-items-center gap-2" style="font-size:0.8rem;color:#fbbf24">
+                  <i class="bi bi-exclamation-triangle-fill"></i>
+                  <span id="serviceModeText"></span>
+                </div>
+              </div>
+              <div class="mt-2">
+                <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:rgba(255,255,255,0.75);margin-bottom:3px">Concurrency Usage</div>
+                <div class="d-flex justify-content-between align-items-center mb-1" style="font-size:0.75rem;color:rgba(255,255,255,0.8)">
+                  <span id="concUsageText">0 of 0 sessions</span>
+                  <span id="concPctText">0%</span>
+                </div>
+                <div style="position:relative;height:14px;background:rgba(0,0,0,0.25);border-radius:7px;overflow:hidden;border:1px solid var(--bd-1);box-shadow:inset 0 1px 2px rgba(0,0,0,0.3)" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-label="Concurrency usage">
+                  <div id="concBottomSoft" style="position:absolute;bottom:0;left:0;height:2px;width:100%;background:#fbbf24;z-index:2"></div>
+                  <div id="concBottomBurst" style="position:absolute;bottom:0;left:100%;height:2px;width:0%;background:#fb923c;z-index:2"></div>
+                  <div id="concurrencyProgressBar" style="height:100%;width:0%;border-radius:4px;transition:width 1s ease;box-shadow:0 0 8px rgba(52,211,153,0.4)"></div>
+                  <div id="concurrencyUpstreamBar" style="position:absolute;top:0;left:0;height:100%;width:0%;border-radius:4px;background-image:radial-gradient(circle, rgba(255,255,255,0.7) 1.5px, transparent 1.5px);background-size:5px 5px;z-index:1;pointer-events:none;transition:width 1s ease"></div>
+                </div>
+              </div>
+              <div id="priorityBudgetSection" class="mt-3"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="card" data-glass data-section="concurrency">
           <div class="glass-panel"></div>
           <div class="card-content">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <span><i class="bi bi-people-fill me-2"></i><span>Current Concurrency</span></span>
+            <div class="card-header collapsible-header d-flex justify-content-between align-items-center" role="button" tabindex="0" aria-expanded="true" onclick="toggleSection('concurrency')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSection('concurrency')}">
+              <span><i class="bi bi-chevron-down toggle-icon me-1"></i><i class="bi bi-people-fill me-2"></i><span>Current Concurrency</span></span>
             </div>
-            <div class="card-body">
+            <div class="card-body collapse-section" id="section-concurrency">
               <div class="stat-grid mb-3">
                 <div>
                   <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#34d399"><div class="stats-value" id="concActive">--</div><div class="stats-label">Active</div></div></div>
@@ -406,34 +437,18 @@
                   <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#fb923c"><div class="stats-value" id="concBurst">--</div><div class="stats-label">Burst</div></div></div>
                 </div>
               </div>
-              <div class="mt-2">
-                <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:rgba(255,255,255,0.75);margin-bottom:3px">Concurrency Usage</div>
-                <div class="d-flex justify-content-between align-items-center mb-1" style="font-size:0.75rem;color:rgba(255,255,255,0.8)">
-                  <span id="concUsageText">0 of 0 sessions</span>
-                  <span id="concPctText">0%</span>
-                </div>
-                <div style="position:relative;height:14px;background:rgba(0,0,0,0.25);border-radius:7px;overflow:hidden;border:1px solid var(--bd-1);box-shadow:inset 0 1px 2px rgba(0,0,0,0.3)" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-label="Concurrency usage">
-                  <!-- Bottom border: yellow for soft cap zone, orange for burst zone -->
-                  <div id="concBottomSoft" style="position:absolute;bottom:0;left:0;height:2px;width:100%;background:#fbbf24;z-index:2"></div>
-                  <div id="concBottomBurst" style="position:absolute;bottom:0;left:100%;height:2px;width:0%;background:#fb923c;z-index:2"></div>
-                  <!-- Solid fill (proxy active) -->
-                  <div id="concurrencyProgressBar" style="height:100%;width:0%;border-radius:4px;transition:width 1s ease;box-shadow:0 0 8px rgba(52,211,153,0.4)"></div>
-                  <!-- Dotted overlay (upstream concurrent) -->
-                  <div id="concurrencyUpstreamBar" style="position:absolute;top:0;left:0;height:100%;width:0%;border-radius:4px;background-image:radial-gradient(circle, rgba(255,255,255,0.7) 1.5px, transparent 1.5px);background-size:5px 5px;z-index:1;pointer-events:none;transition:width 1s ease"></div>
-                </div>
-              </div>
               <div id="concurrencyDetailGrid" class="stat-grid mt-3" style="font-size:0.75rem"></div>
             </div>
           </div>
         </div>
 
-        <div class="card" data-glass>
+        <div class="card" data-glass data-section="window">
           <div class="glass-panel"></div>
           <div class="card-content">
-            <div class="card-header">
-              <span><i class="bi bi-window me-2"></i><span>5-Hour Window</span></span>
+            <div class="card-header collapsible-header" role="button" tabindex="0" aria-expanded="true" onclick="toggleSection('window')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSection('window')}">
+              <i class="bi bi-chevron-down toggle-icon me-1"></i><i class="bi bi-window me-2"></i><span>5-Hour Window</span>
             </div>
-            <div class="card-body">
+            <div class="card-body collapse-section" id="section-window">
               <div class="stat-grid mb-2" id="usageStatGrid">
                 <div>
                   <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#34d399"><div class="stats-value" id="totalRequests">--</div><div class="stats-label">Requests</div></div></div>
@@ -443,6 +458,15 @@
                 </div>
                 <div>
                   <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#60a5fa"><div class="stats-value" id="cachedPct">--</div><div class="stats-label">Cached %</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#f472b6"><div class="stats-value" id="winStartTime" style="color:#fff;font-size:0.75rem">--</div><div class="stats-label">Start Time</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#fbbf24"><div class="stats-value" id="winTokensIn" style="color:#fff;font-size:0.75rem">--</div><div class="stats-label">Tokens In</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#fb923c"><div class="stats-value" id="winTokensOut" style="color:#fff;font-size:0.75rem">--</div><div class="stats-label">Tokens Out</div></div></div>
                 </div>
               </div>
             </div>
@@ -518,23 +542,43 @@
             </div>
           </div>
         </div>
+
+
+        <div class="card" data-glass data-section="status">
+          <div class="glass-panel"></div>
+          <div class="card-content">
+            <div class="card-header collapsible-header" role="button" tabindex="0" aria-expanded="true" onclick="toggleSection('status')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSection('status')}">
+              <i class="bi bi-chevron-down toggle-icon me-1"></i><i class="bi bi-heart-pulse me-2"></i><span>Service Status</span>
+            </div>
+            <div class="card-body collapse-section" id="section-status">
+              <div class="stat-grid mb-2" id="statusStatGrid">
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#34d399"><div class="stats-value" id="statusBand" style="font-size:0.75rem">--</div><div class="stats-label">Status</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#60a5fa"><div class="stats-value" id="statusUptime" style="font-size:0.75rem">--</div><div class="stats-label">Uptime 24h</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#fbbf24"><div class="stats-value" id="statusTTFT" style="font-size:0.75rem">--</div><div class="stats-label">Median TTFT</div></div></div>
+                </div>
+                <div>
+                  <div class="card stat-inline-card h-100"><div class="card-content" style="border-top-color:#fb923c"><div class="stats-value" id="statusTPS" style="font-size:0.75rem">--</div><div class="stats-label">Output tps</div></div></div>
+                </div>
+              </div>
+              <div id="statusModelsTable" style="margin-top:8px"></div>
+              <div id="statusModelsBars" style="display:none;margin-top:8px"></div>
+              <div id="statusModelsHeatmap" style="display:none;margin-top:8px"></div>
+              <div style="display:flex;gap:4px;margin-top:10px;flex-wrap:wrap">
+                <button class="btn btn-outline-action btn-sm status-view-btn active" data-view="table" style="font-size:0.6rem;padding:3px 10px">Table</button>
+                <button class="btn btn-outline-action btn-sm status-view-btn" data-view="bars" style="font-size:0.6rem;padding:3px 10px">Bars</button>
+                <button class="btn btn-outline-action btn-sm status-view-btn" data-view="heatmap" style="font-size:0.6rem;padding:3px 10px">Heatmap</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="col-lg-4">
-        <div class="card" data-glass data-section="tokens">
-          <div class="glass-panel"></div>
-          <div class="card-content">
-            <div class="card-header collapsible-header d-flex justify-content-between align-items-center" role="button" tabindex="0" aria-expanded="false" onclick="toggleSection('tokens')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSection('tokens')}">
-              <span><i class="bi bi-chevron-right toggle-icon collapsed me-1"></i><i class="bi bi-key-fill me-2"></i><span>API Key</span></span>
-              <span class="d-flex align-items-stretch gap-2" style="height:100%">
-                <span class="badge bg-secondary d-flex align-items-center" id="tokenCountBadge" onclick="event.stopPropagation()">0</span>
-                <button class="btn btn-sm btn-outline-action rounded-0" onclick="event.stopPropagation();openKeysModal()" style="font-size:11px"><i class="bi bi-pencil me-1"></i><span>Manage</span></button>
-              </span>
-            </div>
-            <div class="card-body collapse-section collapsed" id="section-tokens"><div id="tokenPoolsContainer"></div></div>
-          </div>
-        </div>
-
         <div class="card" data-glass data-section="quick-settings">
           <div class="glass-panel"></div>
           <div class="card-content">
@@ -591,6 +635,7 @@
                   <button class="btn btn-outline-action btn-apikeymode" data-apikeymode="managed" onclick="toggleApiKeyMode('managed')">Managed</button>
                   <button class="btn btn-outline-action btn-apikeymode" data-apikeymode="passthrough" onclick="toggleApiKeyMode('passthrough')">Pass-Through</button>
                 </div>
+                <button class="btn btn-sm btn-outline-action w-100 mt-1" id="manageKeysBtn" onclick="openKeysModal()" style="font-size:0.6rem;display:none"><i class="bi bi-pencil me-1"></i><span>Manage API Keys</span></button>
               </div>
               <div class="mb-2">
                 <label class="form-label d-flex align-items-center gap-1" style="font-size:0.7rem;color:rgba(255,255,255,0.75);margin-bottom:2px">

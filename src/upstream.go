@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -146,6 +147,97 @@ func (u *UpstreamClient) GetUsage(apiKey string) (json.RawMessage, error) {
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(body), &raw); err != nil {
 		return nil, fmt.Errorf("GetUsage: parsing JSON: %w", err)
+	}
+	return raw, nil
+}
+
+// GetStatus fetches the public health snapshot from upstream.
+// GET {baseURL}/status with Authorization: Bearer header.
+// 10-second timeout enforced via context.
+// Returns the raw response body as json.RawMessage.
+// On non-2xx status, returns an error.
+func (u *UpstreamClient) GetStatus(apiKey string) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.baseURL+"/status", nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatus: creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := u.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatus: executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("GetStatus: upstream returned status %d", resp.StatusCode)
+	}
+
+	body, err := readBodyText(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatus: reading response body: %w", err)
+	}
+
+	var raw json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return nil, fmt.Errorf("GetStatus: parsing JSON: %w", err)
+	}
+	return raw, nil
+}
+
+// GetStatusHistory fetches bucketed status history from upstream.
+// GET {baseURL}/status/history?from=&to=&granularity=&metric=&model=
+// 15-second timeout. Returns the raw response body as json.RawMessage.
+func (u *UpstreamClient) GetStatusHistory(apiKey, from, to, granularity, metric, model string) (json.RawMessage, error) {
+	params := url.Values{}
+	if from != "" {
+		params.Set("from", from)
+	}
+	if to != "" {
+		params.Set("to", to)
+	}
+	if granularity != "" {
+		params.Set("granularity", granularity)
+	}
+	if metric != "" {
+		params.Set("metric", metric)
+	}
+	if model != "" {
+		params.Set("model", model)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.baseURL+"/status/history?"+params.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatusHistory: creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := u.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatusHistory: executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("GetStatusHistory: upstream returned status %d", resp.StatusCode)
+	}
+
+	body, err := readBodyText(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GetStatusHistory: reading response body: %w", err)
+	}
+
+	var raw json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return nil, fmt.Errorf("GetStatusHistory: parsing JSON: %w", err)
 	}
 	return raw, nil
 }

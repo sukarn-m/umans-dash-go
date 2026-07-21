@@ -97,6 +97,8 @@ umans-dash-go/
   - Configurable Request Timeout (slider, 30s-30m, default 15m, applied live without restart)
   - Anthropic path retry support (upstream `/v1/messages` is single-attempt only; this port retries on HTTP 500/503 and network failures with key rotation, matching the OpenAI path)
   - Priority status card replacing Throttled card in the dashboard (always visible, red when Low priority)
+  - Usage Limits card consolidating concurrency usage progress bar and priority budget inline bars with service mode banner
+  - Service Status card with per-model health breakdown (3 view variants: Table/Bars/Heatmap, color thresholds for uptime/TTFT/TPS)
   - Empty SSE stream detection and retry (detects HTTP 200 + `text/event-stream` with zero data bytes; prevents "empty stream" client errors)
   - Non-blocking config updates (request handlers snapshot config fields and release the lock immediately)
   - Vision Handoff Image Cache (SHA-256 keyed LRU, 24h TTL, configurable)
@@ -119,6 +121,9 @@ umans-dash-go/
   - Effective-concurrency cache and gate-limit cache to reduce lock churn under load
   - Shutdown queue draining: rejects queued requests with 503 before draining active requests
   - Redesigned dashboard UI (unified refresh cycle, concurrency card with burst-zone visualization, sortable usage history with per-model drill-down)
+  - Service status proxy endpoints (`/api/umans/status` with 1-min cache, `/api/umans/status-history` with 5-min cache) forwarding raw JSON from upstream `/v1/status` and `/v1/status/history`
+  - Usage Limits dashboard card consolidating concurrency usage and priority budget with service mode banner
+  - Service Status dashboard card with Table/Bars/Heatmap view variants and color-coded health thresholds (uptime, TTFT, TPS)
 - **Shared features** (present in both, no behavioral difference documented):
   - `DISABLED_MODELS` config field, tool schema normalization, thinking payload normalization, reasoning-level adaptive thinking injection
 - **Wallpaper sources:** `none`, `bing`, or `wallhaven` only (no `freegen`)
@@ -217,7 +222,12 @@ const response = await client.messages.create({
 
 Open **http://127.0.0.1:8084** in your browser.
 
-> **Unified refresh cycle:** Status, usage, concurrency, and history all refresh together on the user-selected Automatic Refresh interval. The interval is persisted in `localStorage` and restored on page load (default 30s).
+> **Unified refresh cycle:** Status, usage, concurrency, history, and service status all refresh together on the user-selected Automatic Refresh interval. The interval is persisted in `localStorage` and restored on page load (default 30s).
+
+### Usage Limits Card
+- Consolidates concurrency usage progress bar and priority budget inline bars
+- Service mode banner shown when upstream is in low-interactivity mode
+- Collapsible (expanded by default); remains expanded on mobile
 
 ### Current Concurrency Card
 - 4 stat cards: **Active** (green), **Queued** (blue), **Limit** (soft, yellow), **Burst** (hard cap, orange)
@@ -225,10 +235,11 @@ Open **http://127.0.0.1:8084** in your browser.
 - Bottom-border zone markers: yellow for soft-cap region, orange for burst region
 - The progress bar scales to the effective gate (`barMax`): Soft Cap → `limit`, Hard Cap → `hard_cap`, Manual → `manualLimit`. Zones (green→orange gradient) are shown when `barMax > limit`
 - Percentage shows value relative to the effective gate
+- Collapsible
 
-### 5-hour Window Card
-- **Requests / Throttled / Cached %** — Current window usage with throttled (503 queue-full) count
-- Detail grid: Start Time, Tokens In, Tokens Out
+### 5-Hour Window Card
+- 6 static stat cards: **Requests**, **Throttled**, **Cached %**, **Start Time**, **Tokens In**, **Tokens Out**
+- Collapsible
 
 ### Usage History Card
 - Bar chart with Y-axis labels, dashed grid lines, and X-axis labels
@@ -239,9 +250,11 @@ Open **http://127.0.0.1:8084** in your browser.
 - Status legend shown only in Requests mode; hidden in Tokens mode
 - **Client-side cache** — 30d of data is fetched once per granularity and cached for 5 minutes. Switching between 24h, 7d, and 30d ranges is instant (client-side date filtering, no upstream call)
 
-### API Key (collapsed by default)
-- Key pool display with status badges; manage keys via modal
-- Hidden in Pass-Through mode (client keys are passed through directly)
+### Service Status Card
+- Overall health stats and per-model breakdown
+- 3 view variants: **Table** (default), **Bars**, **Heatmap** — all fully dynamic from the upstream response
+- Color thresholds: uptime ≥99.5% green / ≥99% yellow / below red; TTFT ≤1.5s green / ≤3s yellow / above red; TPS ≥100 green / ≥50 yellow / below red
+- Collapsible
 
 ### Quick Settings (expanded)
 - **Automatic Refresh** — 30s / 1m / 2m / 5m (=298s) interval selector; persisted to `localStorage`
@@ -250,6 +263,7 @@ Open **http://127.0.0.1:8084** in your browser.
 - **Slot Free Delay** — Slider (0–60s, default 2) that delays freeing a concurrency slot after a request completes. Persisted in config (`SLOT_FREE_DELAY`)
 - **Request Timeout** — Slider (30s–30m, default 15m) for upstream request timeout, applied live without restart. Positioned above Retry Attempts
 - **API Key** — Smart / Managed / Pass-Through mode selector
+- **Manage API Keys** — Button to open the key management modal (visible when mode is Smart or Managed; hidden in Pass-Through)
 - **Vision Handoff** — Toggle image handoff for vision-incapable models
 - **Handoff Cache** — Toggle caching of vision handoff image analyses (shown only when Vision Handoff is enabled)
 - Sections collapse with a chevron icon that swaps between `bi-chevron-down` (expanded) and `bi-chevron-right` (collapsed)
@@ -272,7 +286,8 @@ Open **http://127.0.0.1:8084** in your browser.
 - User ID (click-to-reveal, masked by default) and online status indicator
 
 ### Mobile Layout
-- Right-column sections (Quick Settings, Quick Actions, API Key, Models, Environment) collapse by default on screens ≤575px
+- All sections except Usage Limits collapse by default on screens ≤575px
+- Right-column sections (Quick Settings, Quick Actions, Models, Environment) remain accessible via collapse toggles
 
 ## API Key Mode
 
@@ -289,7 +304,7 @@ The proxy supports three modes for selecting which API key is sent to the upstre
 - **Smart**: prefers the last-known-good client key, falls back to the pool key
 - **Managed**: uses the pool key
 
-The **API Key** card is hidden from the dashboard in Pass-Through mode.
+The **Manage API Keys** button in Quick Settings is hidden in Pass-Through mode.
 
 ## Vision Handoff
 
@@ -332,6 +347,8 @@ The built-in prompt instructs the handoff model to produce a factual, third-pers
 | `GET` | `/api/umans/usage-history` | UMANS usage history (supports `from`, `to`, `granularity`, `scope`; `?fresh=1` bypasses cache) |
 | `GET` | `/api/umans/concurrency` | Concurrency sessions, limit, hard_cap, active count & queue depth (supports `?fresh=1`) |
 | `GET` | `/api/umans/user` | UMANS user info |
+| `GET` | `/api/umans/status` | UMANS service status (supports `?fresh=1` to bypass cache) |
+| `GET` | `/api/umans/status-history` | UMANS status history (supports `from`, `to`, `granularity`, `metric`, `model`; `?fresh=1` bypasses cache) |
 | `GET` | `/api/keys` | List API keys |
 | `POST` | `/api/keys` | Add/update/delete API keys |
 | `GET` | `/api/bg` | Daily Bing wallpaper |

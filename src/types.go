@@ -165,12 +165,33 @@ type Pricing struct {
 
 // UsageInfo holds the current usage window data.
 type UsageInfo struct {
-	RequestsInWindow   int           `json:"requests_in_window"`
-	TokensIn           int           `json:"tokens_in"`
-	TokensOut          int           `json:"tokens_out"`
-	TokensCached       int           `json:"tokens_cached"`
-	ConcurrentSessions int           `json:"concurrent_sessions"`
-	Priority           *PriorityInfo `json:"priority"`
+	RequestsInWindow   int                   `json:"requests_in_window"`
+	TokensIn           int                   `json:"tokens_in"`
+	TokensOut          int                   `json:"tokens_out"`
+	TokensCached       int                   `json:"tokens_cached"`
+	ConcurrentSessions int                   `json:"concurrent_sessions"`
+	Priority           *PriorityInfo         `json:"priority"`
+	ServiceMode        *ServiceModeInfo      `json:"service_mode"`
+	PriorityBudget     []PriorityBudgetEntry `json:"priority_budget"`
+}
+
+// ServiceModeInfo holds the current service mode from upstream.
+// "interactive" in normal operation, "low_interactivity" during
+// exceptionally heavy days. resets_at is null when not applicable.
+type ServiceModeInfo struct {
+	Current  string  `json:"current"`
+	ResetsAt *string `json:"resets_at"`
+}
+
+// PriorityBudgetEntry represents a single category in the priority budget.
+type PriorityBudgetEntry struct {
+	Category        string   `json:"category"`
+	Label           string   `json:"label"`
+	Models          []string `json:"models"`
+	UsedPct         int      `json:"used_pct"`
+	OverBudgetToday bool     `json:"over_budget_today"`
+	Mode            string   `json:"mode"`
+	ResetsAt        *string  `json:"resets_at"`
 }
 
 // PriorityInfo holds the upstream priority status.
@@ -399,6 +420,13 @@ type usageHistoryCacheEntry struct {
 	key       string
 }
 
+// statusHistoryCacheEntry holds cached status history data with a fetch timestamp and cache key.
+type statusHistoryCacheEntry struct {
+	data      interface{}
+	fetchedAt time.Time
+	key       string
+}
+
 // ImageHandoffCache is an LRU cache for vision handoff image descriptions.
 // Keyed by SHA-256 hash of the image data URI. 50 entries max, 24h TTL.
 type ImageHandoffCache struct {
@@ -514,6 +542,11 @@ type Proxy struct {
 	usageHistoryCache *usageHistoryCacheEntry
 	// §6.3: effective concurrency cache (invalidated by fetchConcurrency)
 	effectiveConcurrencyCache *ConcurrencyData
+
+	// Status endpoint caches (short TTL — status is relatively static)
+	statusCache        json.RawMessage
+	statusCacheFetchedAt time.Time
+	statusHistoryCache   *statusHistoryCacheEntry
 
 	// Cache fields for §8 Model Catalog
 	mu sync.RWMutex

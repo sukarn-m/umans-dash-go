@@ -238,8 +238,8 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         btn.classList.toggle('active', isActive);
         btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
       });
-      const tokensCard = document.querySelector('[data-section="tokens"]');
-      if (tokensCard) tokensCard.style.display = mode === 'passthrough' ? 'none' : '';
+      const manageBtn = document.getElementById('manageKeysBtn');
+      if (manageBtn) manageBtn.style.display = (mode === 'smart' || mode === 'managed') ? '' : 'none';
     }
     async function toggleApiKeyMode(mode) {
       const prevMode = document.querySelector('.btn-apikeymode.active')?.dataset.apikeymode || 'smart';
@@ -318,11 +318,11 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
 
     function renderTokenPools() {
       const container = document.getElementById('tokenPoolsContainer');
+      if (!container) return;
       if (!proxyData || !proxyData.token_state || !proxyData.token_state.length) {
         container.innerHTML = '<div class="text-center py-3"><i class="bi bi-key" style="font-size:2rem;color:rgba(255,255,255,0.7)"></i><p class="mt-2 text-muted">' + escapeHtml('No API keys') + '</p></div>';
-        document.getElementById('tokenCountBadge').textContent = '0'; return;
+        return;
       }
-      document.getElementById('tokenCountBadge').textContent = proxyData.token_state.length;
       container.innerHTML = proxyData.token_state.map(p => {
         const isOn = p.status === 'active';
         return `<div class="pool-card"><div class="pool-header"><div class="pool-name">${escapeHtml(p.name)}</div><span class="badge rounded-pill" style="background:${isOn?'rgba(52,211,153,0.2)':'rgba(248,113,113,0.2)'};color:${isOn?'#34d399':'#f87171'};font-size:0.7rem;font-weight:600;border:1px solid ${isOn?'rgba(52,211,153,0.3)':'rgba(248,113,113,0.3)'}">${isOn?'Active':'Inactive'}</span></div><div style="font-size:0.85rem;color:rgba(255,255,255,0.7)">${escapeHtml(p.token)}</div></div>`;
@@ -437,6 +437,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         document.getElementById('concPctText').textContent = parseFloat(pctVsSoft.toFixed(2)) + '%';
         const pb = document.querySelector('[role="progressbar"]');
         if (pb) pb.setAttribute('aria-valuenow', Math.round(activePct).toString());
+        layoutStatGrids();
         // Detail items
         const detailGrid = document.getElementById('concurrencyDetailGrid');
         const details = [];
@@ -575,7 +576,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         }
         // Mobile: collapse right-column sections by default
         if (window.matchMedia('(max-width: 575px)').matches) {
-          ['quick-settings', 'actions', 'tokens', 'models', 'env'].forEach(s => {
+          ['concurrency', 'window', 'status', 'history', 'quick-settings', 'actions', 'models', 'env'].forEach(s => {
             const sec = document.getElementById('section-' + s);
             const icon = document.querySelector('[data-section="' + s + '"] .toggle-icon');
             const hdr = document.querySelector('[data-section="' + s + '"] .collapsible-header');
@@ -594,6 +595,7 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
         const loader = document.getElementById('wallpaperLoader');
         if (loader) loader.style.display = 'none';
         fetchUsage();
+        fetchStatus();
         setTimeout(initLiquidGlass, 50);
         setTimeout(()=>window.dispatchEvent(new Event('resize')),500);
       } catch(e) { showToast('Failed to load configuration','danger'); }
@@ -624,31 +626,250 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
             prioEl.style.color = '#fff';
           }
         }
+        // Start Time / Tokens In / Tokens Out — static cards now
+        const startTime = win.started_at ? new Date(win.started_at).toLocaleTimeString() : '--';
+        const stEl = document.getElementById('winStartTime');
+        if (stEl) stEl.textContent = startTime;
+        const tiEl = document.getElementById('winTokensIn');
+        if (tiEl) tiEl.textContent = formatCompact(tokensIn);
+        const toEl = document.getElementById('winTokensOut');
+        if (toEl) toEl.textContent = formatCompact(tokensOut);
         if (plan.display_name) {
           document.getElementById('planBadge').textContent = plan.display_name;
           document.getElementById('planBadge').style.display = '';
         } else {
           document.getElementById('planBadge').style.display = 'none';
         }
-        const statGrid = document.getElementById('usageStatGrid');
-        // Remove previously appended detail cards (keep first 3 static)
-        while (statGrid.children.length > 3) {
-          statGrid.removeChild(statGrid.lastChild);
+        // Service mode banner — only show when not interactive
+        const banner = document.getElementById('serviceModeBanner');
+        const bannerText = document.getElementById('serviceModeText');
+        if (banner && bannerText) {
+          const sm = usage.service_mode;
+          if (sm && sm.current && sm.current !== 'interactive') {
+            let msg = 'Low Interactivity Mode active';
+            if (sm.resets_at) {
+              const resetTime = new Date(sm.resets_at);
+              const now = new Date();
+              const minsLeft = Math.max(0, Math.round((resetTime - now) / 60000));
+              if (minsLeft > 60) {
+                msg += ' — resumes at ' + resetTime.toLocaleString();
+              } else {
+                msg += ' — resumes in ~' + minsLeft + ' min';
+              }
+            }
+            bannerText.textContent = msg;
+            banner.style.display = '';
+          } else {
+            banner.style.display = 'none';
+          }
         }
-        const details = [];
-        const startTime = win.started_at ? new Date(win.started_at).toLocaleTimeString() : '--';
-        details.push({label:'Start Time', value: startTime, color:'#f472b6'});
-        details.push({label:'Tokens In', value: formatCompact(tokensIn), color:'#fbbf24'});
-        details.push({label:'Tokens Out', value: formatCompact(tokensOut), color:'#fb923c'});
-        // Priority is no longer appended dynamically — it's a static card now
-        details.forEach(d => {
-          const div = document.createElement('div');
-          div.innerHTML = `<div class="card stat-inline-card h-100"><div class="card-content" style="${d.color?`border-top-color:${d.color};`:''}"><div class="stats-value" style="color:${d.warn?'#fbbf24':'#fff'};font-size:0.75rem">${escapeHtml(d.value)}</div><div class="stats-label">${escapeHtml(d.label)}</div></div></div>`;
-          statGrid.appendChild(div);
-        });
+        // Priority budget — render to its own card
+        renderPriorityBudget(usage.priority_budget);
         layoutStatGrids();
       } catch { document.getElementById('priorityStatus').textContent='--';document.getElementById('totalRequests').textContent='--';document.getElementById('cachedPct').textContent='--'; }
     }
+
+    function renderPriorityBudget(budget) {
+      const container = document.getElementById('priorityBudgetSection');
+      if (!container) return;
+      container.innerHTML = '';
+      if (!budget || budget.length === 0) {
+        return;
+      }
+      for (const pb of budget) {
+        const pct = pb.used_pct || 0;
+        const overBudget = pb.over_budget_today;
+        const barColor = overBudget ? '#f87171' : (pct >= 80 ? '#fbbf24' : '#34d399');
+        const label = pb.label || pb.category || 'Budget';
+        let subtext = '';
+        if (pb.mode && pb.mode !== 'interactive') {
+          subtext = 'Low Interactivity';
+          if (pb.resets_at) {
+            const r = new Date(pb.resets_at);
+            const minsLeft = Math.max(0, Math.round((r - new Date()) / 60000));
+            subtext += ' — resumes in ~' + minsLeft + ' min';
+          }
+        }
+        const modelsText = (pb.models && pb.models.length > 0) ? pb.models.join(', ') : '';
+        const div = document.createElement('div');
+        div.style.marginTop = '12px';
+        div.innerHTML = `
+          <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:rgba(255,255,255,0.75);margin-bottom:3px">${escapeHtml(label)}</div>
+          <div class="d-flex justify-content-between align-items-center mb-1" style="font-size:0.75rem;color:rgba(255,255,255,0.8)">
+            <span>${escapeHtml(modelsText)}</span>
+            <span>${pct}%${overBudget?' <span style="color:#f87171">Over Budget</span>':''}</span>
+          </div>
+          <div style="position:relative;height:14px;background:rgba(0,0,0,0.25);border-radius:7px;overflow:hidden;border:1px solid var(--bd-1);box-shadow:inset 0 1px 2px rgba(0,0,0,0.3)">
+            <div style="height:100%;width:${pct}%;background:${barColor};border-radius:4px;transition:width 0.5s ease;box-shadow:0 0 8px ${overBudget?'rgba(248,113,113,0.4)':'rgba(52,211,153,0.4)'}"></div>
+          </div>
+          ${subtext ? `<div style="font-size:0.6rem;color:#fbbf24;margin-top:3px">${escapeHtml(subtext)}</div>` : ''}
+        `;
+        container.appendChild(div);
+      }
+    }
+
+    async function fetchStatus() {
+      try {
+        const r = await fetch('/api/umans/status');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        const overall = d.overall || {};
+        const models = d.models || {};
+
+        // Overall stats
+        const bandEl = document.getElementById('statusBand');
+        if (bandEl) {
+          const band = overall.status || '--';
+          bandEl.textContent = band.charAt(0).toUpperCase() + band.slice(1);
+          bandEl.style.color = band === 'operational' ? '#34d399' : (band === 'degraded' ? '#fbbf24' : '#f87171');
+        }
+        const uptimeEl = document.getElementById('statusUptime');
+        if (uptimeEl) {
+          const up = overall.uptime_pct_24h;
+          uptimeEl.textContent = (up != null ? up.toFixed(1) + '%' : '--');
+        }
+        const ttftEl = document.getElementById('statusTTFT');
+        if (ttftEl) {
+          const ttft = overall.latency && overall.latency.ttft_ms && overall.latency.ttft_ms.p50;
+          ttftEl.textContent = (ttft != null ? (ttft / 1000).toFixed(1) + 's' : '--');
+        }
+        const tpsEl = document.getElementById('statusTPS');
+        if (tpsEl) {
+          const tps = overall.output_tokens_per_second && overall.output_tokens_per_second.p50;
+          tpsEl.textContent = (tps != null ? tps.toFixed(0) + ' tps' : '--');
+        }
+
+        // Per-model breakdown — 4 variants, all rendered, toggle visibility
+        const modelIds = Object.keys(models).sort();
+        if (modelIds.length === 0) {
+          const grid = document.getElementById('statusModelsGrid');
+          if (grid) grid.innerHTML = '<div style="font-size:0.7rem;color:var(--t-4);padding:8px 4px">No model data available</div>';
+        } else {
+          // Collect parsed values for all models
+          const parsed = modelIds.map(mid => {
+            const m = models[mid];
+            const mBand = m.status || 'unknown';
+            const mUptime = m.uptime_pct_24h;
+            const mTtft = m.latency && m.latency.ttft_ms && m.latency.ttft_ms.p50;
+            const mTps = m.output_tokens_per_second && m.output_tokens_per_second.p50;
+            const bandColor = mBand === 'operational' ? '#34d399' : (mBand === 'degraded' ? '#fbbf24' : '#f87171');
+            const displayName = allDisplayNames[mid] || mid;
+            const uptimePct = mUptime != null ? mUptime : 0;
+            const uptimeColor = uptimePct >= 99.5 ? '#34d399' : (uptimePct >= 99 ? '#fbbf24' : '#f87171');
+            const ttftVal = mTtft != null ? (mTtft / 1000).toFixed(1) + 's' : '--';
+            const tpsVal = mTps != null ? mTps.toFixed(0) : '--';
+            return { mid, displayName, mBand, bandColor, mUptime, uptimePct, uptimeColor, mTtft, mTps, ttftVal, tpsVal };
+          });
+
+          // For relative bars
+          const maxTtft = Math.max(...parsed.map(p => p.mTtft || 0), 1);
+          const maxTps = Math.max(...parsed.map(p => p.mTps || 0), 1);
+
+          // --- Variant 1: Table ---
+          const tableEl = document.getElementById('statusModelsTable');
+          if (tableEl) {
+            tableEl.innerHTML = `
+              <div style="overflow-x:auto">
+              <table class="table-dark table-sm w-100" style="margin:0;font-size:0.65rem">
+                <thead><tr>
+                  <th style="color:var(--t-3);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;padding:4px 6px;border-color:var(--bd-1)">Model</th>
+                  <th style="color:var(--t-3);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;padding:4px 6px;border-color:var(--bd-1);text-align:center">Status</th>
+                  <th style="color:var(--t-3);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;padding:4px 6px;border-color:var(--bd-1);text-align:right">Uptime</th>
+                  <th style="color:var(--t-3);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;padding:4px 6px;border-color:var(--bd-1);text-align:right">TTFT</th>
+                  <th style="color:var(--t-3);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;padding:4px 6px;border-color:var(--bd-1);text-align:right">TPS</th>
+                </tr></thead>
+                <tbody>
+                ${parsed.map(p => `
+                  <tr>
+                    <td style="padding:5px 6px;border-color:var(--bd-1);color:var(--t-1);font-weight:600">${escapeHtml(p.displayName)}</td>
+                    <td style="padding:5px 6px;border-color:var(--bd-1);text-align:center"><span style="font-size:0.55rem;padding:1px 6px;border-radius:8px;background:${p.bandColor}22;color:${p.bandColor};text-transform:uppercase">${escapeHtml(p.mBand)}</span></td>
+                    <td style="padding:5px 6px;border-color:var(--bd-1);text-align:right;color:${p.uptimeColor};font-weight:600">${p.mUptime != null ? p.mUptime.toFixed(1) + '%' : '--'}</td>
+                    <td style="padding:5px 6px;border-color:var(--bd-1);text-align:right;color:var(--t-1)">${p.ttftVal}</td>
+                    <td style="padding:5px 6px;border-color:var(--bd-1);text-align:right;color:var(--t-1)">${p.tpsVal}</td>
+                  </tr>
+                `).join('')}
+                </tbody>
+              </table>
+              </div>`;
+          }
+
+          // --- Variant 3: Horizontal comparison bars ---
+          const barsEl = document.getElementById('statusModelsBars');
+          if (barsEl) {
+            const ttftColor = (v) => v <= 1500 ? '#34d399' : (v <= 3000 ? '#fbbf24' : '#f87171');
+            const tpsColor = (v) => v >= 100 ? '#34d399' : (v >= 50 ? '#fbbf24' : '#f87171');
+            barsEl.innerHTML = `
+              <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:rgba(255,255,255,0.75);margin-bottom:6px">TTFT (lower is better)</div>
+              ${parsed.map(p => {
+                const pct = p.mTtft ? Math.min(100, (p.mTtft / maxTtft) * 100) : 0;
+                const c = p.mTtft ? ttftColor(p.mTtft) : '#64748b';
+                return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                  <span style="font-size:0.6rem;color:var(--t-2);min-width:90px;flex-shrink:0;text-align:right">${escapeHtml(p.displayName)}</span>
+                  <div style="flex:1;height:12px;background:rgba(0,0,0,0.25);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${c};border-radius:3px;transition:width 0.5s ease"></div></div>
+                  <span style="font-size:0.6rem;color:var(--t-1);font-weight:600;min-width:36px">${p.ttftVal}</span>
+                </div>`;
+              }).join('')}
+              <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:rgba(255,255,255,0.75);margin:10px 0 6px">Output TPS (higher is better)</div>
+              ${parsed.map(p => {
+                const pct = p.mTps ? Math.min(100, (p.mTps / maxTps) * 100) : 0;
+                const c = p.mTps ? tpsColor(p.mTps) : '#64748b';
+                return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                  <span style="font-size:0.6rem;color:var(--t-2);min-width:90px;flex-shrink:0;text-align:right">${escapeHtml(p.displayName)}</span>
+                  <div style="flex:1;height:12px;background:rgba(0,0,0,0.25);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${c};border-radius:3px;transition:width 0.5s ease"></div></div>
+                  <span style="font-size:0.6rem;color:var(--t-1);font-weight:600;min-width:36px">${p.tpsVal}</span>
+                </div>`;
+              }).join('')}
+            `;
+          }
+
+          // --- Variant 4: Heatmap grid ---
+          const heatmapEl = document.getElementById('statusModelsHeatmap');
+          if (heatmapEl) {
+            const cell = (label, value, color, bgColor) => `
+              <div style="text-align:center;padding:6px 4px;background:${bgColor};border-radius:6px;border:1px solid var(--bd-1)">
+                <div style="font-size:0.55rem;color:var(--t-3);text-transform:uppercase;margin-bottom:2px">${label}</div>
+                <div style="font-size:0.75rem;font-weight:700;color:${color}">${value}</div>
+              </div>`;
+            heatmapEl.innerHTML = `
+              <div style="display:grid;grid-template-columns:auto repeat(4, 1fr);gap:3px;font-size:0.65rem">
+                <div></div>
+                <div style="text-align:center;font-size:0.55rem;color:var(--t-3);text-transform:uppercase;padding:4px 2px">Uptime</div>
+                <div style="text-align:center;font-size:0.55rem;color:var(--t-3);text-transform:uppercase;padding:4px 2px">TTFT</div>
+                <div style="text-align:center;font-size:0.55rem;color:var(--t-3);text-transform:uppercase;padding:4px 2px">TPS</div>
+                <div style="text-align:center;font-size:0.55rem;color:var(--t-3);text-transform:uppercase;padding:4px 2px">Status</div>
+                ${parsed.map(p => `
+                  <div style="padding:4px 6px;color:var(--t-1);font-weight:600;display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${p.bandColor};flex-shrink:0"></span>${escapeHtml(p.displayName)}</div>
+                  ${cell('', p.mUptime != null ? p.mUptime.toFixed(1)+'%' : '--', p.uptimeColor, p.uptimeColor+'11')}
+                  ${cell('', p.ttftVal, p.mTtft ? (p.mTtft <= 1500 ? '#34d399' : p.mTtft <= 3000 ? '#fbbf24' : '#f87171') : 'var(--t-3)', (p.mTtft ? (p.mTtft <= 1500 ? '#34d399' : p.mTtft <= 3000 ? '#fbbf24' : '#f87171') : '#64748b')+'11')}
+                  ${cell('', p.tpsVal, p.mTps ? (p.mTps >= 100 ? '#34d399' : p.mTps >= 50 ? '#fbbf24' : '#f87171') : 'var(--t-3)', (p.mTps ? (p.mTps >= 100 ? '#34d399' : p.mTps >= 50 ? '#fbbf24' : '#f87171') : '#64748b')+'11')}
+                  ${cell('', p.mBand, p.bandColor, p.bandColor+'11')}
+                `).join('')}
+              </div>`;
+          }
+        }
+      } catch (e) {
+        const bandEl = document.getElementById('statusBand');
+        if (bandEl) bandEl.textContent = '--';
+      }
+    }
+
+    // Status model view switcher
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.status-view-btn');
+      if (!btn) return;
+      document.querySelectorAll('.status-view-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const view = btn.dataset.view;
+      const containers = {
+        table: 'statusModelsTable',
+        bars: 'statusModelsBars',
+        heatmap: 'statusModelsHeatmap'
+      };
+      Object.entries(containers).forEach(([v, id]) => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = (v === view) ? '' : 'none';
+      });
+    });
 
     function updateStats() {
       if(!proxyData) return;
@@ -1283,10 +1504,10 @@ const SURFACE_FNS = { convex_squircle: (x) => Math.pow(1 - Math.pow(1 - x, 4), 0
       const ms = parseInt(seconds) * 1000;
       localStorage.setItem('refreshInterval', seconds.toString());
       if (!skipImmediate) {
-        fetchUsage(); fetchConcurrency(); updateStatus(); fetchHistory();
+        fetchUsage(); fetchConcurrency(); updateStatus(); fetchHistory(); fetchServiceStatus();
       }
       // Single unified cycle: status + usage + concurrency + history all refresh together
-      usageIntervalId = setInterval(() => { updateStatus(); fetchUsage(); fetchConcurrency(); }, ms);
+      usageIntervalId = setInterval(() => { updateStatus(); fetchUsage(); fetchConcurrency(); fetchServiceStatus(); }, ms);
       historyIntervalId = setInterval(() => { fetchHistory(); }, ms);
       document.querySelectorAll('.btn-refresh').forEach(btn => {
         const isActive = btn.dataset.refresh === seconds.toString();

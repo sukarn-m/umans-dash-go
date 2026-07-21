@@ -27,6 +27,8 @@ const (
 	APIKeyEnvVar           = "UMANS_API_KEY"
 	ModelCatalogCacheTTL   = 5 * time.Minute
 	UsageCacheTTL          = 5 * time.Minute
+	StatusCacheTTL         = 1 * time.Minute  // status is relatively static
+	StatusHistoryCacheTTL = 5 * time.Minute  // matches usage history
 	UpstreamModelsCacheTTL = 5 * time.Minute  // §8.7
 	UserInfoCacheTTL       = 5 * time.Minute  // §8.8
 	UserInfoCacheTimeout   = 10 * time.Second // §7.2 GetUserInfo timeout

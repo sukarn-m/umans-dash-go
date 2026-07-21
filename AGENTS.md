@@ -58,11 +58,14 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 | `KeyPool` | Round-robin multi-key pool with cooldown/unhealthy marking |
 | `ImageHandoffCache` | LRU cache for vision handoff image descriptions (SHA-256 keyed, 50 entries, 24h TTL) |
 | `QueueItem` | A queued or in-flight request: `Response`, `Req` (with **detached context** via `context.WithoutCancel` so it survives `ServeHTTP` return), `Payload`, `Model`, `Format` (`"openai"`/`"anthropic"`), `WriteError`/`WritePassthroughError`, `Fingerprint`, `PreferredKeyIndex`, `IsStream`, and **`Done chan struct{}`** — closed by `runDispatch` (via defer) and all rejection paths when the request completes; handlers block on `<-done` to keep `ServeHTTP` alive until the request finishes |
-| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state; `retryConfigMu` (`RWMutex`) / `retryAttempts` / `backoffStrategy` for thread-safe retry config state. Queue infrastructure: `queueCond` (`*sync.Cond` bound to `queueMu`), `queuePending` (bool — a `ProcessQueue` pass is scheduled), `queueDone` (`chan struct{}` — closed during shutdown to cancel pending slot-free delays), `workerWG` (`sync.WaitGroup` for the queue worker goroutine), `queueShutdownOnce` (`sync.Once` guarding `close(queueDone)`), `visionHandoffSem` (`chan struct{}` — proxy-wide vision-handoff concurrency limit, nil if disabled) |
+| `Proxy` | Central state holder — all runtime state lives here. Includes `lastClientKeyMu` (`RWMutex`) / `lastClientKey` for last-known-good client API key tracking; `concurrencyLimitMu` (`RWMutex`) / `concurrencyLimitMode` / `manualLimit` for thread-safe concurrency limit mode state; `retryConfigMu` (`RWMutex`) / `retryAttempts` / `backoffStrategy` for thread-safe retry config state. Queue infrastructure: `queueCond` (`*sync.Cond` bound to `queueMu`), `queuePending` (bool — a `ProcessQueue` pass is scheduled), `queueDone` (`chan struct{}` — closed during shutdown to cancel pending slot-free delays), `workerWG` (`sync.WaitGroup` for the queue worker goroutine), `queueShutdownOnce` (`sync.Once` guarding `close(queueDone)`), `visionHandoffSem` (`chan struct{}` — proxy-wide vision-handoff concurrency limit, nil if disabled). Status cache: `statusCache` (`json.RawMessage`) / `statusCacheFetchedAt` (`time.Time`) for `/api/umans/status` (1-min TTL); `statusHistoryCache` (`*statusHistoryCacheEntry`) for `/api/umans/status-history` (5-min TTL, keyed by params) |
 | `ModelInfo` / `Capabilities` | Model metadata from upstream catalog |
-| `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types |
+| `UsageData` / `UsageInfo` / `WindowInfo` / `PlanInfo` | Usage tracking types. `UsageInfo` now includes **`ServiceMode`** (`*ServiceModeInfo`, JSON `service_mode`) and **`PriorityBudget`** (`[]PriorityBudgetEntry`, JSON `priority_budget`) |
+| `ServiceModeInfo` | Current service mode from upstream: `Current` (string, e.g. `"interactive"` or `"low_interactivity"`), `ResetsAt` (`*string`, null when not applicable) |
+| `PriorityBudgetEntry` | A single category in the priority budget: `Category`, `Label`, `Models` (`[]string`), `UsedPct` (int), `OverBudgetToday` (bool), `Mode` (string), `ResetsAt` (`*string`) |
 | `ConcurrencyData` | Concurrency limits and current state |
 | `ImagePart` | An image found in a request payload (for vision handoff) |
+| `statusHistoryCacheEntry` | Cached status history data: `data` (`interface{}`), `fetchedAt` (`time.Time`), `key` (string — MD5 of query params). Used by `HandleStatusHistory` for 5-min param-keyed caching |
 
 ## Key Functions (src/)
 
@@ -72,6 +75,10 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `ParseListenPort(addr string) int` — Extract port from `"host:port"`
 - `LoadConfig() (Config, error)` — validates `RequestTimeout > 0` (fatal if not)
 - `saveConfig(cfg Config) error` — **atomic write** via `config.json.tmp` + `os.Rename`
+
+### Cache TTLs (package-level constants)
+- `StatusCacheTTL = 1 * time.Minute` — cache duration for `/api/umans/status` (relatively static)
+- `StatusHistoryCacheTTL = 5 * time.Minute` — cache duration for `/api/umans/status-history` (matches usage history)
 
 ### KeyPool
 - `NewKeyPool(keys []KeyConfig) *KeyPool` — each entry defaults `CooldownMs = 30000`, `Healthy = true`
@@ -127,7 +134,9 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `extractClientAPIKey(req *http.Request) string` — reads `X-Api-Key` header, else `Authorization: Bearer` token
 - `(*Proxy) setLastClientKey(key string)` — thread-safe write under `lastClientKeyMu.Lock`
 - `(*Proxy) getLastClientKey() string` — thread-safe read under `lastClientKeyMu.RLock`
-- `(*Proxy) upstreamAPIKeyForDashboard() string` — selects the key for usage/history/concurrency calls per mode: passthrough→last client key; smart→last client key with pool fallback; managed→pool key
+- `(*Proxy) upstreamAPIKeyForDashboard() string` — selects the key for usage/history/concurrency/status/status-history calls per mode: passthrough→last client key; smart→last client key with pool fallback; managed→pool key
+- `(*UpstreamClient) GetStatus(apiKey string) (json.RawMessage, error)` — fetches the public health snapshot from upstream `GET {baseURL}/status`. 10-second context timeout. Returns raw JSON. On non-2xx, returns error.
+- `(*UpstreamClient) GetStatusHistory(apiKey, from, to, granularity, metric, model string) (json.RawMessage, error)` — fetches bucketed status history from upstream `GET {baseURL}/status/history?from=&to=&granularity=&metric=&model=`. 15-second context timeout. Returns raw JSON. On non-2xx, returns error.
 
 ### Concurrency Limit Mode & Slot Free Delay
 - `(*Proxy) getConcurrencyLimitMode() string` — thread-safe read under `concurrencyLimitMu.RLock`
@@ -192,9 +201,11 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - **Shared `catalogClient`** — reused `http.Client` for catalog/models/user-info fetches with keep-alive.
 - **`gateLimit()` cache** — 1-second TTL cache to reduce lock churn under load.
 - **Effective-concurrency cache** — keyed on `Limit`/`HardCap`/`OverrideConcurrency` to avoid recomputation per queue operation.
+- **Status cache** — `statusCache` (`json.RawMessage`) on `Proxy` with `StatusCacheTTL` (1 min). On upstream failure, cached data is returned as fallback. Protected by `p.mu`.
+- **Status history cache** — `statusHistoryCache` (`*statusHistoryCacheEntry`) on `Proxy` with `StatusHistoryCacheTTL` (5 min), keyed by MD5 of all query params. On upstream failure, cached data is returned as fallback. Protected by `p.mu`.
 
 ### API Key Thread Safety
-- **No shared mutable `apiKey` field on `UpstreamClient`** — the API key is passed as an explicit parameter to `ChatCompletions`, `Messages`, `doPost`, `GetUsage`, and `GetUserInfo`. This eliminates the data race that occurred when multiple goroutines called `SetAPIKey` concurrently on the shared `p.Upstream` instance.
+- **No shared mutable `apiKey` field on `UpstreamClient`** — the API key is passed as an explicit parameter to `ChatCompletions`, `Messages`, `doPost`, `GetUsage`, `GetUserInfo`, `GetStatus`, and `GetStatusHistory`. This eliminates the data race that occurred when multiple goroutines called `SetAPIKey` concurrently on the shared `p.Upstream` instance.
 - `SetAPIKey(key string)` still exists for backward compatibility but is not used in the request hot path.
 
 ### HTTP Helpers
@@ -224,7 +235,9 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - `(*Proxy) HandleKeysGet(w, r)` / `HandleKeysPost(w, r)` — `HandleKeysGet` acquires `configMu.RLock()`
 - `(*Proxy) HandleUsage(w, r)` / `HandleConcurrency(w, r)` — `HandleConcurrency` response includes `concurrency_limit_mode` and `manual_limit` fields; `FetchUsage`/`FetchUsageHistory` call `upstreamAPIKeyForDashboard()` before upstream calls
 - `(*Proxy) HandleUsageHistory(w, r)` / `HandleUser(w, r)` — `HandleUser` returns `user_id` from `LastConcurrency`
-- `(*Proxy) HandleRequest(w, r)` — main router
+- `(*Proxy) HandleStatus(w, r)` — proxies upstream `/v1/status`. Caches for `StatusCacheTTL` (1 min); `?fresh=1` bypasses cache. On upstream failure, returns cached data if available (cache fallback). Calls `upstreamAPIKeyForDashboard()` for the key.
+- `(*Proxy) HandleStatusHistory(w, r)` — proxies upstream `/v1/status/history`. Caches for `StatusHistoryCacheTTL` (5 min), keyed by all query params (`from`, `to`, `granularity`, `metric`, `model`); `?fresh=1` bypasses cache. On upstream failure, returns cached data if available, otherwise an empty series response. Calls `upstreamAPIKeyForDashboard()` for the key.
+- `(*Proxy) HandleRequest(w, r)` — main router. Routes include `/api/umans/status` → `HandleStatus`, `/api/umans/status-history` → `HandleStatusHistory` (alongside existing `/api/umans/usage`, `/api/umans/concurrency`, `/api/umans/usage-history`, `/api/umans/user`, etc.)
 - `(*Proxy) HandleBingWallpaper(w, r)` — daily cache; calls `upgradePeapixResolution()` for UHD variant
 - `(*Proxy) HandleWallhavenWallpaper(w, r)` — hourly cache; `atleast=2560x1440` filter; uses `isValidImage` + `serveWallpaperImageTyped` with `imageContentType`
 
@@ -235,7 +248,13 @@ A Go rewrite of the [UMANS-Dash](../umans-dash/proxy.js) (~3,326 lines of Node.j
 - **Retry Attempts slider** — range slider (0–10, default 2) in Quick Settings. POSTs `retryAttempts` to `/api/config` on change. Shows live value.
 - **Backoff Strategy dropdown** — select in Quick Settings (hidden when retries=0). Options: Aggressive (1s→60s) or Conservative (5s→300s). POSTs `backoffStrategy` to `/api/config` on change. Shows delay sequence preview below.
 - **Priority card** — replaces the old Throttled card in the usage stat grid. Always visible. Shows "Low (reason)" in yellow when priority is low, "Normal" in white otherwise.
-- **Collapsed-by-default sections** — Quick Actions, Models, and Environment sections start collapsed (have `collapsed` class in HTML). Other sections (Quick Settings, Usage History, etc.) start expanded.
+- **Usage Limits card** — consolidates concurrency usage progress bar and priority budget inline bars (matching visual style). Shows a service mode banner when upstream is in low-interactivity mode. Collapsible (expanded by default).
+- **Service Status card** — overall health stats and per-model breakdown with 3 view variants: Table (default), Bars, Heatmap. All views are fully dynamic from the upstream `/api/umans/status` response. Color thresholds: uptime ≥99.5% green / ≥99% yellow / below red; TTFT ≤1.5s green / ≤3s yellow / above red; TPS ≥100 green / ≥50 yellow / below red. Collapsible.
+- **5-Hour Window card** — uses 6 static stat cards instead of dynamic DOM injection. Collapsible.
+- **Removed standalone API Key card** — Manage API Keys button moved into Quick Settings (visible when API key mode is Smart or Managed; hidden in Pass-Through).
+- **Collapsible cards** — Usage Limits, Current Concurrency, 5-Hour Window, Service Status, and Usage History are all collapsible (matching pattern).
+- **Mobile auto-collapse** — all sections except Usage Limits collapse by default on screens ≤575px.
+- **Collapsed-by-default sections** — Quick Actions, Models, and Environment sections start collapsed (have `collapsed` class in HTML). Other sections start expanded.
 - **Environment section** — shows Version (from `proxyData.version`), Runtime (Go version), Port, and Started At. The collapsed header preview text shows `v{version} · {runtime} · :{port}`.
 - **Header title** — "UMANS Dash Go" (was "UMANS Dash").
 - `setWallpaper(src, skipConfigSave)` — `skipConfigSave` parameter avoids redundant POST during init

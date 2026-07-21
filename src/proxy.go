@@ -340,6 +340,10 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		p.HandleConcurrency(w, r)
 	case path == "/api/umans/usage-history":
 		p.HandleUsageHistory(w, r)
+	case path == "/api/umans/status" && r.Method == http.MethodGet:
+		p.HandleStatus(w, r)
+	case path == "/api/umans/status-history" && r.Method == http.MethodGet:
+		p.HandleStatusHistory(w, r)
 	case path == "/api/umans/user":
 		p.HandleUser(w, r)
 	case path == "/api/restart":

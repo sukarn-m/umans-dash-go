@@ -903,6 +903,165 @@ func (p *Proxy) HandleUsageHistory(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, data)
 }
 
+// HandleStatus proxies the upstream /v1/status endpoint.
+// Caches for StatusCacheTTL (1 min). ?fresh=1 bypasses cache.
+func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+	fresh := r.URL.Query().Get("fresh") == "1"
+
+	// Check cache first
+	if !fresh {
+		p.mu.RLock()
+		if p.statusCache != nil && time.Since(p.statusCacheFetchedAt) < StatusCacheTTL {
+			data := p.statusCache
+			p.mu.RUnlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(data)
+			return
+		}
+		p.mu.RUnlock()
+	}
+
+	// Need upstream
+	if p.Upstream == nil {
+		// Return cached data or empty
+		p.mu.RLock()
+		data := p.statusCache
+		p.mu.RUnlock()
+		if data != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(data)
+			return
+		}
+		WriteJSON(w, http.StatusOK, map[string]interface{}{"error": "upstream not available"})
+		return
+	}
+
+	dashKey := p.upstreamAPIKeyForDashboard()
+	raw, err := p.Upstream.GetStatus(dashKey)
+	if err != nil {
+		log.Printf("HandleStatus: upstream fetch failed: %v", err)
+		// Return cached data or error
+		p.mu.RLock()
+		data := p.statusCache
+		p.mu.RUnlock()
+		if data != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(data)
+			return
+		}
+		WriteOpenAIError(w, http.StatusBadGateway, "failed to fetch status", "api_error", "")
+		return
+	}
+
+	// Cache the result
+	p.mu.Lock()
+	p.statusCache = raw
+	p.statusCacheFetchedAt = time.Now()
+	p.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(raw)
+}
+
+// HandleStatusHistory proxies the upstream /v1/status/history endpoint.
+// Caches for StatusHistoryCacheTTL (5 min), keyed by all params.
+// ?fresh=1 bypasses cache.
+func (p *Proxy) HandleStatusHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		WriteOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+	fresh := r.URL.Query().Get("fresh") == "1"
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
+	granularity := r.URL.Query().Get("granularity")
+	if granularity == "" {
+		granularity = "hour"
+	}
+	metric := r.URL.Query().Get("metric")
+	model := r.URL.Query().Get("model")
+
+	cacheKey := md5Hash(fmt.Sprintf("%v", map[string]string{
+		"from":        from,
+		"to":          to,
+		"granularity": granularity,
+		"metric":      metric,
+		"model":       model,
+	}))
+
+	// Check cache
+	if !fresh {
+		p.mu.RLock()
+		if p.statusHistoryCache != nil && p.statusHistoryCache.key == cacheKey &&
+			time.Since(p.statusHistoryCache.fetchedAt) < StatusHistoryCacheTTL {
+			data := p.statusHistoryCache.data
+			p.mu.RUnlock()
+			WriteJSON(w, http.StatusOK, data)
+			return
+		}
+		p.mu.RUnlock()
+	}
+
+	// Need upstream
+	if p.Upstream == nil {
+		WriteJSON(w, http.StatusOK, map[string]interface{}{
+			"granularity": granularity,
+			"from":        from,
+			"to":          to,
+			"series":      []interface{}{},
+		})
+		return
+	}
+
+	dashKey := p.upstreamAPIKeyForDashboard()
+	raw, err := p.Upstream.GetStatusHistory(dashKey, from, to, granularity, metric, model)
+	if err != nil {
+		log.Printf("HandleStatusHistory: upstream fetch failed: %v", err)
+		// Return cached data or empty
+		p.mu.RLock()
+		cached := p.statusHistoryCache
+		p.mu.RUnlock()
+		if cached != nil {
+			WriteJSON(w, http.StatusOK, cached.data)
+			return
+		}
+		WriteJSON(w, http.StatusOK, map[string]interface{}{
+			"granularity": granularity,
+			"from":        from,
+			"to":          to,
+			"series":      []interface{}{},
+		})
+		return
+	}
+
+	// Parse and cache
+	var data interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		log.Printf("HandleStatusHistory: failed to parse response: %v", err)
+		WriteJSON(w, http.StatusOK, map[string]interface{}{
+			"granularity": granularity,
+			"from":        from,
+			"to":          to,
+			"series":      []interface{}{},
+		})
+		return
+	}
+
+	p.mu.Lock()
+	p.statusHistoryCache = &statusHistoryCacheEntry{
+		data:      data,
+		fetchedAt: time.Now(),
+		key:       cacheKey,
+	}
+	p.mu.Unlock()
+
+	WriteJSON(w, http.StatusOK, data)
+}
+
 func (p *Proxy) HandleUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		WriteOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
